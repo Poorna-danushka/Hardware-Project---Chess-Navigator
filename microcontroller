@@ -1,0 +1,652 @@
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <avr/pgmspace.h>
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+
+#define SERVO_MIN 150
+#define SERVO_MAX 600
+#define NUM_SERVOS 4
+
+byte GRIPPER_CHANNEL = 4;
+byte GRIPPER_OPEN = 70;   // Adjust these gripper angles accordingly
+byte GRIPPER_CLOSE = 106;
+
+byte lastAngles[NUM_SERVOS];
+
+const byte hold[] = {95, 141, 115, 124};
+const byte bin[]  = {142, 84, 55, 124};
+const byte start[] = {5, 141, 115, 136};
+const byte endr[]={142,141, 115, 124};
+
+// Define all squares and their upper positions
+const byte a1[] = {71, 52, 11, 124}, a1u[] = {74, 78, 27, 137};
+const byte b1[] = {77, 56, 11, 130}, b1u[] = {77, 74, 20, 144};
+const byte c1[] = {84, 55, 10, 135}, c1u[] = {85, 80, 32, 140};
+const byte d1[] = {89, 56, 10, 135}, d1u[] = {92, 83, 34, 140};
+const byte e1[] = {94, 58, 10, 135}, e1u[] = {97, 81, 34, 140};
+const byte f1[] = {102, 55, 10, 135}, f1u[] = {105, 81, 32, 140};
+const byte g1[] = {110, 65, 11, 130}, g1u[] = {109, 75, 20, 144};
+const byte h1[] = {111, 65, 11, 130}, h1u[] = {114, 77, 27, 137};
+
+const byte a2[] = {70, 57, 15, 138}, a2u[] = {74, 78, 27, 137};
+const byte b2[] = {77, 60, 20, 138}, b2u[] = {77, 74, 20, 144};
+const byte c2[] = {82, 70, 27, 134}, c2u[] = {85, 80, 32, 140};
+const byte d2[] = {88, 67, 39, 125}, d2u[] = {92, 83, 34, 140};
+const byte e2[] = {98, 70, 39, 125}, e2u[] = {97, 81, 34, 140};
+const byte f2[] = {102, 63, 27, 134}, f2u[] = {105, 81, 32, 140};
+const byte g2[] = {110, 66, 20, 138}, g2u[] = {109, 75, 20, 144};
+const byte h2[] = {115, 58, 15, 138}, h2u[] = {114, 77, 27, 137};
+
+const byte a3[] = {68, 70, 45,123}, a3u[] = {68, 78, 30, 144};
+const byte b3[] = {75, 76, 58, 115}, b3u[] = {74, 84, 44, 137};
+const byte c3[] = {82, 79, 62, 114}, c3u[] = {81, 91, 52, 133};
+const byte d3[] = {90, 80, 65, 114}, d3u[] = {90, 92, 54, 133};
+const byte e3[] = {97, 80, 66, 113}, e3u[] = {98, 91, 54, 133};
+const byte f3[] = {103, 78, 62, 114}, f3u[] = {104, 91, 52, 133};
+const byte g3[] = {111, 77, 60, 115}, g3u[] = {111, 86, 44, 137};
+const byte h3[] = {116, 77, 45, 125}, h3u[] = {116, 70, 30, 144};
+
+const byte a4[] = {66, 85, 69, 110}, a4u[] = {67, 87, 51, 138};
+const byte b4[] = {74, 84, 73, 110}, b4u[] = {74, 95, 64, 130};
+const byte c4[] = {80, 86, 79, 109}, c4u[] = {81, 102, 76, 120};
+const byte d4[] = {89, 89, 83, 106}, d4u[] = {89, 101, 72, 125};
+const byte e4[] = {98, 90, 83, 106}, e4u[] = {97, 101, 72, 125};
+const byte f4[] = {105, 88, 81, 106}, f4u[] = {106, 103, 76, 120};
+const byte g4[] = {112, 84, 75, 110}, g4u[] = {114, 96, 64, 130};
+const byte h4[] = {118, 84, 71, 110}, h4u[] = {120, 89, 51, 138};
+
+const byte a5[] = {63, 87, 83, 104}, a5u[] = {65, 97, 68, 131};
+const byte b5[] = {70, 91, 90, 104}, b5u[] = {72, 103, 81, 123};
+const byte c5[] = {80, 95, 98, 99}, c5u[] = {81, 106, 85, 121};
+const byte d5[] = {88, 95, 101, 99}, d5u[] = {88, 109, 89, 118};
+const byte e5[] = {99, 98, 101, 99}, e5u[] = {98, 110, 89, 118};
+const byte f5[] = {109, 95, 98, 99}, f5u[] = {108, 108, 85, 121};
+const byte g5[] = {114, 94, 92, 104}, g5u[] = {116, 105, 81, 123};
+const byte h5[] = {122, 90, 84, 104}, h5u[] = {124, 98, 68, 131};
+
+const byte a6[] = {58, 95, 98, 97}, a6u[] = {59, 108, 87, 121};
+const byte b6[] = {68, 97, 104, 97}, b6u[] = {68, 114, 98, 114};
+const byte c6[] = {77, 99, 111, 93}, c6u[] = {79, 119, 102, 114};
+const byte d6[] = {88, 103, 115, 89}, d6u[] = {88, 119, 104, 114};
+const byte e6[] = {98, 102, 115, 89}, e6u[] = {100, 120, 104, 114};
+const byte f6[] = {111, 99, 110, 93}, f6u[] = {111, 119, 102, 114};
+const byte g6[] = {119, 98, 104, 97}, g6u[] = {120, 112, 98, 114};
+const byte h6[] = {124, 96, 101, 100}, h6u[] = {128, 109, 87, 121};
+
+const byte a7[] = {52, 98, 111, 89}, a7u[] = {53, 112, 97, 119};
+const byte b7[] = {61, 102, 117, 93}, b7u[] = {64, 121, 109, 114};
+const byte c7[] = {73, 104, 124, 84}, c7u[] = {75, 125, 112, 114};
+const byte d7[] = {86, 106, 127, 86}, d7u[] = {89, 128, 115, 114};
+const byte e7[] = {101, 106, 127, 86}, e7u[] = {102, 127, 115, 114};
+const byte f7[] = {113, 105, 125, 84}, f7u[] = {115, 127, 112, 114};
+const byte g7[] = {123, 103, 117, 93}, g7u[] = {125, 124, 109, 114};
+const byte h7[] = {132, 99, 113, 89}, h7u[] = {135, 113, 97, 119};
+
+const byte a8[] = {44, 103, 118, 91}, a8u[] = {46, 120, 106, 117};
+const byte b8[] = {54, 107, 129, 82}, b8u[] = {57, 127, 116, 114};
+const byte c8[] = {69, 111, 134, 80}, c8u[] = {70, 136, 123, 112};
+const byte d8[] = {83, 111, 140, 80}, d8u[] = {89, 137, 125, 114};
+const byte e8[] = {102, 110, 140, 80}, e8u[] = {106, 137, 125, 114};
+const byte f8[] = {117, 109, 135, 80}, f8u[] = {122, 140, 126, 112};
+const byte g8[] = {129, 108, 130, 82}, g8u[] = {138, 130, 116, 114};
+const byte h8[] = {138, 102, 119, 91}, h8u[] = {142, 121, 106, 117};
+
+const byte* getPositionByName(const char* name) {
+  if (strcmp_P(name, PSTR("a1")) == 0) return a1;
+  if (strcmp_P(name, PSTR("a1u")) == 0) return a1u;
+  if (strcmp_P(name, PSTR("b1")) == 0) return b1;
+  if (strcmp_P(name, PSTR("b1u")) == 0) return b1u;
+  if (strcmp_P(name, PSTR("c1")) == 0) return c1;
+  if (strcmp_P(name, PSTR("c1u")) == 0) return c1u;
+  if (strcmp_P(name, PSTR("d1")) == 0) return d1;
+  if (strcmp_P(name, PSTR("d1u")) == 0) return d1u;
+  if (strcmp_P(name, PSTR("e1")) == 0) return e1;
+  if (strcmp_P(name, PSTR("e1u")) == 0) return e1u;
+  if (strcmp_P(name, PSTR("f1")) == 0) return f1;
+  if (strcmp_P(name, PSTR("f1u")) == 0) return f1u;
+  if (strcmp_P(name, PSTR("g1")) == 0) return g1;
+  if (strcmp_P(name, PSTR("g1u")) == 0) return g1u;
+  if (strcmp_P(name, PSTR("h1")) == 0) return h1;
+  if (strcmp_P(name, PSTR("h1u")) == 0) return h1u;
+
+  // Rank 2
+  if (strcmp_P(name, PSTR("a2")) == 0) return a2;
+  if (strcmp_P(name, PSTR("a2u")) == 0) return a2u;
+  if (strcmp_P(name, PSTR("b2")) == 0) return b2;
+  if (strcmp_P(name, PSTR("b2u")) == 0) return b2u;
+  if (strcmp_P(name, PSTR("c2")) == 0) return c2;
+  if (strcmp_P(name, PSTR("c2u")) == 0) return c2u;
+  if (strcmp_P(name, PSTR("d2")) == 0) return d2;
+  if (strcmp_P(name, PSTR("d2u")) == 0) return d2u;
+  if (strcmp_P(name, PSTR("e2")) == 0) return e2;
+  if (strcmp_P(name, PSTR("e2u")) == 0) return e2u;
+  if (strcmp_P(name, PSTR("f2")) == 0) return f2;
+  if (strcmp_P(name, PSTR("f2u")) == 0) return f2u;
+  if (strcmp_P(name, PSTR("g2")) == 0) return g2;
+  if (strcmp_P(name, PSTR("g2u")) == 0) return g2u;
+  if (strcmp_P(name, PSTR("h2")) == 0) return h2;
+  if (strcmp_P(name, PSTR("h2u")) == 0) return h2u;
+
+  // Rank 3
+  if (strcmp_P(name, PSTR("a3")) == 0) return a3;
+  if (strcmp_P(name, PSTR("a3u")) == 0) return a3u;
+  if (strcmp_P(name, PSTR("b3")) == 0) return b3;
+  if (strcmp_P(name, PSTR("b3u")) == 0) return b3u;
+  if (strcmp_P(name, PSTR("c3")) == 0) return c3;
+  if (strcmp_P(name, PSTR("c3u")) == 0) return c3u;
+  if (strcmp_P(name, PSTR("d3")) == 0) return d3;
+  if (strcmp_P(name, PSTR("d3u")) == 0) return d3u;
+  if (strcmp_P(name, PSTR("e3")) == 0) return e3;
+  if (strcmp_P(name, PSTR("e3u")) == 0) return e3u;
+  if (strcmp_P(name, PSTR("f3")) == 0) return f3;
+  if (strcmp_P(name, PSTR("f3u")) == 0) return f3u;
+  if (strcmp_P(name, PSTR("g3")) == 0) return g3;
+  if (strcmp_P(name, PSTR("g3u")) == 0) return g3u;
+  if (strcmp_P(name, PSTR("h3")) == 0) return h3;
+  if (strcmp_P(name, PSTR("h3u")) == 0) return h3u;
+
+  // Rank 4
+  if (strcmp_P(name, PSTR("a4")) == 0) return a4;
+  if (strcmp_P(name, PSTR("a4u")) == 0) return a4u;
+  if (strcmp_P(name, PSTR("b4")) == 0) return b4;
+  if (strcmp_P(name, PSTR("b4u")) == 0) return b4u;
+  if (strcmp_P(name, PSTR("c4")) == 0) return c4;
+  if (strcmp_P(name, PSTR("c4u")) == 0) return c4u;
+  if (strcmp_P(name, PSTR("d4")) == 0) return d4;
+  if (strcmp_P(name, PSTR("d4u")) == 0) return d4u;
+  if (strcmp_P(name, PSTR("e4")) == 0) return e4;
+  if (strcmp_P(name, PSTR("e4u")) == 0) return e4u;
+  if (strcmp_P(name, PSTR("f4")) == 0) return f4;
+  if (strcmp_P(name, PSTR("f4u")) == 0) return f4u;
+  if (strcmp_P(name, PSTR("g4")) == 0) return g4;
+  if (strcmp_P(name, PSTR("g4u")) == 0) return g4u;
+  if (strcmp_P(name, PSTR("h4")) == 0) return h4;
+  if (strcmp_P(name, PSTR("h4u")) == 0) return h4u;
+
+  // Rank 5
+  if (strcmp_P(name, PSTR("a5")) == 0) return a5;
+  if (strcmp_P(name, PSTR("a5u")) == 0) return a5u;
+  if (strcmp_P(name, PSTR("b5")) == 0) return b5;
+  if (strcmp_P(name, PSTR("b5u")) == 0) return b5u;
+  if (strcmp_P(name, PSTR("c5")) == 0) return c5;
+  if (strcmp_P(name, PSTR("c5u")) == 0) return c5u;
+  if (strcmp_P(name, PSTR("d5")) == 0) return d5;
+  if (strcmp_P(name, PSTR("d5u")) == 0) return d5u;
+  if (strcmp_P(name, PSTR("e5")) == 0) return e5;
+  if (strcmp_P(name, PSTR("e5u")) == 0) return e5u;
+  if (strcmp_P(name, PSTR("f5")) == 0) return f5;
+  if (strcmp_P(name, PSTR("f5u")) == 0) return f5u;
+  if (strcmp_P(name, PSTR("g5")) == 0) return g5;
+  if (strcmp_P(name, PSTR("g5u")) == 0) return g5u;
+  if (strcmp_P(name, PSTR("h5")) == 0) return h5;
+  if (strcmp_P(name, PSTR("h5u")) == 0) return h5u;
+
+  // Rank 6
+  if (strcmp_P(name, PSTR("a6")) == 0) return a6;
+  if (strcmp_P(name, PSTR("a6u")) == 0) return a6u;
+  if (strcmp_P(name, PSTR("b6")) == 0) return b6;
+  if (strcmp_P(name, PSTR("b6u")) == 0) return b6u;
+  if (strcmp_P(name, PSTR("c6")) == 0) return c6;
+  if (strcmp_P(name, PSTR("c6u")) == 0) return c6u;
+  if (strcmp_P(name, PSTR("d6")) == 0) return d6;
+  if (strcmp_P(name, PSTR("d6u")) == 0) return d6u;
+  if (strcmp_P(name, PSTR("e6")) == 0) return e6;
+  if (strcmp_P(name, PSTR("e6u")) == 0) return e6u;
+  if (strcmp_P(name, PSTR("f6")) == 0) return f6;
+  if (strcmp_P(name, PSTR("f6u")) == 0) return f6u;
+  if (strcmp_P(name, PSTR("g6")) == 0) return g6;
+  if (strcmp_P(name, PSTR("g6u")) == 0) return g6u;
+  if (strcmp_P(name, PSTR("h6")) == 0) return h6;
+  if (strcmp_P(name, PSTR("h6u")) == 0) return h6u;
+
+  // Rank 7
+  if (strcmp_P(name, PSTR("a7")) == 0) return a7;
+  if (strcmp_P(name, PSTR("a7u")) == 0) return a7u;
+  if (strcmp_P(name, PSTR("b7")) == 0) return b7;
+  if (strcmp_P(name, PSTR("b7u")) == 0) return b7u;
+  if (strcmp_P(name, PSTR("c7")) == 0) return c7;
+  if (strcmp_P(name, PSTR("c7u")) == 0) return c7u;
+  if (strcmp_P(name, PSTR("d7")) == 0) return d7;
+  if (strcmp_P(name, PSTR("d7u")) == 0) return d7u;
+  if (strcmp_P(name, PSTR("e7")) == 0) return e7;
+  if (strcmp_P(name, PSTR("e7u")) == 0) return e7u;
+  if (strcmp_P(name, PSTR("f7")) == 0) return f7;
+  if (strcmp_P(name, PSTR("f7u")) == 0) return f7u;
+  if (strcmp_P(name, PSTR("g7")) == 0) return g7;
+  if (strcmp_P(name, PSTR("g7u")) == 0) return g7u;
+  if (strcmp_P(name, PSTR("h7")) == 0) return h7;
+  if (strcmp_P(name, PSTR("h7u")) == 0) return h7u;
+
+  // Rank 8
+  if (strcmp_P(name, PSTR("a8")) == 0) return a8;
+  if (strcmp_P(name, PSTR("a8u")) == 0) return a8u;
+  if (strcmp_P(name, PSTR("b8")) == 0) return b8;
+  if (strcmp_P(name, PSTR("b8u")) == 0) return b8u;
+  if (strcmp_P(name, PSTR("c8")) == 0) return c8;
+  if (strcmp_P(name, PSTR("c8u")) == 0) return c8u;
+  if (strcmp_P(name, PSTR("d8")) == 0) return d8;
+  if (strcmp_P(name, PSTR("d8u")) == 0) return d8u;
+  if (strcmp_P(name, PSTR("e8")) == 0) return e8;
+  if (strcmp_P(name, PSTR("e8u")) == 0) return e8u;
+  if (strcmp_P(name, PSTR("f8")) == 0) return f8;
+  if (strcmp_P(name, PSTR("f8u")) == 0) return f8u;
+  if (strcmp_P(name, PSTR("g8")) == 0) return g8;
+  if (strcmp_P(name, PSTR("g8u")) == 0) return g8u;
+  if (strcmp_P(name, PSTR("h8")) == 0) return h8;
+  if (strcmp_P(name, PSTR("h8u")) == 0) return h8u;
+
+  // Special positions
+  if (strcmp_P(name, PSTR("start")) == 0) return start;
+  if (strcmp_P(name, PSTR("hold")) == 0) return hold;
+  if (strcmp_P(name, PSTR("endr")) == 0) return endr;
+  if (strcmp_P(name, PSTR("bin")) == 0) return bin;
+
+  return nullptr;  // Position not found
+}
+// ---------------------------------
+
+int angleToPulse(byte angle) {
+  angle = constrain(angle, 0, 180);
+  return map(angle, 0, 180, SERVO_MIN, SERVO_MAX);
+}
+
+void openGripper() {
+  Serial.println("Opening gripper...");
+  pwm.setPWM(GRIPPER_CHANNEL, 0, angleToPulse(GRIPPER_OPEN));
+  delay(300);
+}
+
+void closeGripper() {
+  Serial.println("Closing gripper...");
+  pwm.setPWM(GRIPPER_CHANNEL, 0, angleToPulse(GRIPPER_CLOSE));
+  delay(300);
+}
+
+void moveToPositionSmoothSync(const byte* targetAngles, int delayTime = 10) {
+  int steps[NUM_SERVOS];
+  float directions[NUM_SERVOS];
+  int maxSteps = 0;
+
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    steps[i] = abs((int)targetAngles[i] - (int)lastAngles[i]);
+    directions[i] = (targetAngles[i] > lastAngles[i]) ? 1.0 : -1.0;
+    if (steps[i] > maxSteps) maxSteps = steps[i];
+  }
+
+  maxSteps = max(maxSteps * 4, 30);  // Smooth movement with minimum steps
+
+  for (int step = 0; step <= maxSteps; step++) {
+    float t = (float)step / maxSteps;
+    float easedT = t * t * t * (t * (6 * t - 15) + 10);  // quintic easing in/out
+
+    for (int i = 0; i < NUM_SERVOS; i++) {
+      if (steps[i] == 0) continue;
+      int interpolated = (int)lastAngles[i] + round(easedT * steps[i] * directions[i]);
+      interpolated = constrain(interpolated, 0, 180);
+      pwm.setPWM(i, 0, angleToPulse((byte)interpolated));
+    }
+    delay(delayTime);
+  }
+
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    lastAngles[i] = targetAngles[i];
+    pwm.setPWM(i, 0, angleToPulse(lastAngles[i]));
+  }
+}
+
+// Helper: get upper position name by appending 'u'
+bool getUpperPositionName(const char* base, char* dest, size_t destSize) {
+  if (strlen(base) + 1 >= destSize) return false;
+  strcpy(dest, base);
+  strcat(dest, "u");
+  return true;
+}
+
+void handleNormalMove(const char* from, const char* to) {
+  Serial.print("=== Normal Move: ");
+  Serial.print(from);
+  Serial.print(" -> ");
+  Serial.println(to);
+
+  char fromUpper[8] = {0};
+  char toUpper[8] = {0};
+
+  if (!getUpperPositionName(from, fromUpper, sizeof(fromUpper)) ||
+      !getUpperPositionName(to, toUpper, sizeof(toUpper))) {
+    Serial.println("Error: Position name too long");
+    return;
+  }
+
+  const byte* fromUpperPtr = getPositionByName(fromUpper);
+  const byte* fromPtr = getPositionByName(from);
+  const byte* toUpperPtr = getPositionByName(toUpper);
+  const byte* toPtr = getPositionByName(to);
+
+  if (!fromUpperPtr || !fromPtr || !toUpperPtr || !toPtr) {
+    Serial.println("Error: Invalid square name(s)");
+    return;
+  }
+
+  delay(2000);
+  moveToPositionSmoothSync(hold);
+  delay(500);
+  moveToPositionSmoothSync(fromUpperPtr);
+  delay(500);
+  moveToPositionSmoothSync(fromPtr);
+  delay(1500);
+  closeGripper();
+  delay(1000);
+  moveToPositionSmoothSync(fromUpperPtr);
+  delay(500);
+  moveToPositionSmoothSync(hold);
+  delay(500);
+  moveToPositionSmoothSync(toUpperPtr);
+  delay(500);
+  moveToPositionSmoothSync(toPtr);
+  delay(1500);
+  openGripper(); 
+  delay(1000); 
+  moveToPositionSmoothSync(toUpperPtr);
+  delay(500);
+  moveToPositionSmoothSync(hold);
+  moveToPositionSmoothSync(start);
+
+  Serial.println("MOVE_DONE");
+}
+
+void handleCaptureMove(const char* captured, const char* own, const char* destination) {
+  Serial.println("=== Capture Move ===");
+
+  char capU[8] = {0};
+  char ownU[8] = {0};
+  char destU[8] = {0};
+
+  // Create names for the 'upper' positions (like "a2u")
+  if (strlen(captured) + 1 >= sizeof(capU) ||
+      strlen(own) + 1 >= sizeof(ownU) ||
+      strlen(destination) + 1 >= sizeof(destU)) {
+    Serial.println("Error: Position name too long");
+    return;
+  }
+
+  strcpy(capU, captured);
+  strcat(capU, "u");
+  
+  strcpy(ownU, own);
+  strcat(ownU, "u");
+  
+  strcpy(destU, destination);
+  strcat(destU, "u");
+
+  // Lookup all relevant positions
+  const byte* capUPos = getPositionByName(capU);
+  const byte* capPos = getPositionByName(captured);
+  const byte* ownUPos = getPositionByName(ownU);
+  const byte* ownPos = getPositionByName(own);
+  const byte* destUPos = getPositionByName(destU);
+  const byte* destPos = getPositionByName(destination);
+
+  // Validate positions
+  if (!capUPos || !capPos || !ownUPos || !ownPos || !destUPos || !destPos) {
+    return;
+  }
+
+  delay(1000);
+  
+  // Move captured piece to bin
+  moveToPositionSmoothSync(hold);
+  delay(500);
+
+  moveToPositionSmoothSync(capUPos);
+  delay(500);
+  
+  moveToPositionSmoothSync(capPos);
+  delay(1000);
+  
+  closeGripper();
+  delay(1000);
+
+  moveToPositionSmoothSync(capUPos);
+  delay(500);
+
+  moveToPositionSmoothSync(hold);
+  delay(500);
+
+  moveToPositionSmoothSync(endr);
+  delay(500);
+
+  moveToPositionSmoothSync(bin);
+  delay(500);
+  
+  openGripper();
+  delay(1000);
+
+  moveToPositionSmoothSync(endr);
+  delay(500);
+
+  moveToPositionSmoothSync(hold);
+  delay(500);
+
+  moveToPositionSmoothSync(ownUPos);
+  delay(500);
+
+  moveToPositionSmoothSync(ownPos);
+  delay(1000);
+
+  closeGripper();
+  delay(1000);
+
+  moveToPositionSmoothSync(ownUPos);
+  delay(500);
+
+  moveToPositionSmoothSync(hold);
+  delay(500);
+
+  moveToPositionSmoothSync(destUPos);
+  delay(500);
+
+  moveToPositionSmoothSync(destPos);
+  delay(500);
+
+  openGripper();
+  delay(1000);
+
+  moveToPositionSmoothSync(destUPos);
+  delay(500);
+
+  moveToPositionSmoothSync(hold);
+
+  delay(500);
+
+  moveToPositionSmoothSync(start);
+
+  Serial.println("MOVE_DONE");
+}
+
+void handleCastleMove(const char* kingStart, const char* kingEnd, const char* rookStart, const char* rookEnd) {
+  Serial.println("=== Castling Move ===");
+
+  char kingUStart[8] = {0};
+  char kingUEnd[8] = {0};
+  char rookUStart[8] = {0};
+  char rookUEnd[8] = {0};
+
+  // Build "upper" positions
+  if (strlen(kingStart) + 1 >= sizeof(kingUStart) ||
+      strlen(kingEnd) + 1 >= sizeof(kingUEnd) ||
+      strlen(rookStart) + 1 >= sizeof(rookUStart) ||
+      strlen(rookEnd) + 1 >= sizeof(rookUEnd)) {
+    Serial.println("Error: Position name too long");
+    return;
+  }
+
+  strcpy(kingUStart, kingStart);
+  strcat(kingUStart, "u");
+
+  strcpy(kingUEnd, kingEnd);
+  strcat(kingUEnd, "u");
+
+  strcpy(rookUStart, rookStart);
+  strcat(rookUStart, "u");
+
+  strcpy(rookUEnd, rookEnd);
+  strcat(rookUEnd, "u");
+
+  // Lookup positions
+  const byte* kStart = getPositionByName(kingStart);
+  const byte* kEnd   = getPositionByName(kingEnd);
+  const byte* kUStart= getPositionByName(kingUStart);
+  const byte* kUEnd  = getPositionByName(kingUEnd);
+
+  const byte* rStart = getPositionByName(rookStart);
+  const byte* rEnd   = getPositionByName(rookEnd);
+  const byte* rUStart= getPositionByName(rookUStart);
+  const byte* rUEnd  = getPositionByName(rookUEnd);
+
+  if (!kStart || !kEnd || !kUStart || !kUEnd ||
+      !rStart || !rEnd || !rUStart || !rUEnd) {
+    Serial.println("Error: Invalid position(s)");
+    return;
+  }
+
+  delay(1000);
+
+  // === Move King ===
+  moveToPositionSmoothSync(hold);
+  delay(500);
+
+  moveToPositionSmoothSync(kUStart);
+  delay(500);
+
+  moveToPositionSmoothSync(kStart);
+  delay(1000);
+
+  closeGripper();
+  delay(1000);
+
+  moveToPositionSmoothSync(kUStart);
+  delay(500);
+
+  moveToPositionSmoothSync(hold);
+  delay(500);
+
+  moveToPositionSmoothSync(kUEnd);
+  delay(500);
+
+  moveToPositionSmoothSync(kEnd);
+  delay(500);
+
+  openGripper();
+  delay(1000);
+
+  moveToPositionSmoothSync(kUEnd);
+  delay(500);
+
+  moveToPositionSmoothSync(hold);
+  delay(500);
+
+  // === Move Rook ===
+  moveToPositionSmoothSync(rUStart);
+  delay(500);
+
+  moveToPositionSmoothSync(rStart);
+  delay(1000);
+
+  closeGripper();
+  delay(1000);
+
+  moveToPositionSmoothSync(rUStart);
+  delay(500);
+
+  moveToPositionSmoothSync(hold);
+  delay(500);
+
+  moveToPositionSmoothSync(rUEnd);
+  delay(500);
+
+  moveToPositionSmoothSync(rEnd);
+  delay(500);
+
+  openGripper();
+  delay(1000);
+
+  moveToPositionSmoothSync(rUEnd);
+  delay(500);
+
+  moveToPositionSmoothSync(hold);
+  delay(500);
+
+  moveToPositionSmoothSync(start);
+
+  Serial.println("MOVE_DONE");
+}
+
+void setup() {
+  Serial.begin(9600);
+  pwm.begin();
+  pwm.setPWMFreq(50);  // Typical servo freq
+
+  // Initialize servos to start position
+  for (byte i = 0; i < NUM_SERVOS; i++) {
+    pwm.setPWM(i, 0, angleToPulse(start[i]));  // Move immediately to start
+    lastAngles[i] = start[i];                   // Sync state
+  }
+  delay(500);
+
+  Serial.println("System Initialized.");
+  openGripper();
+  moveToPositionSmoothSync(start);
+
+  Serial.println("Enter command:");
+}
+
+void loop() {
+  static char input[50];
+  static byte inputIndex = 0;
+
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    // Ignore carriage return (\r)
+    if (c == '\r') continue;
+
+    // End of line detected
+    if (c == '\n') {
+      if (inputIndex > 0) {  
+        input[inputIndex] = '\0'; // Null-terminate input string
+        
+        Serial.println(input);
+
+        // Parse input using strtok
+        char* first = strtok(input, ",");
+        char* second = strtok(NULL, ",");
+        char* third = strtok(NULL, ",");
+        char* fourth = strtok(NULL, ",");
+
+        if (first && second && !third && !fourth) {
+          // 2 fields -> Normal move
+          handleNormalMove(first, second);
+        }
+        else if (first && second && third && !fourth) {
+          // 3 fields -> Capture move
+          handleCaptureMove(first, second, third);
+        }
+        else if (first && second && third && fourth) {
+          // 4 fields -> Castling move (king + rook move)
+          handleCastleMove(first, second, third, fourth);
+        }
+        else {
+          Serial.println("❌ Invalid command format.");
+        }
+
+        inputIndex = 0;
+      }
+    }
+    else {
+      if (inputIndex < sizeof(input) - 1) {
+        input[inputIndex++] = c;
+      }
+    }
+  }
+}
