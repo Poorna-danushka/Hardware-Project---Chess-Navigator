@@ -1,0 +1,1772 @@
+import pygame as p
+from chessEngine import *
+from smartMoveFinder import *
+from multiprocessing import Process, Queue as MPQueue
+import threading
+import queue
+import time
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+import sys
+import os
+import serial
+import math
+import pygame.freetype
+
+# --- Constants ---
+DIMENSION = 8
+MAX_FPS = 30
+IMAGES = {}
+SERIAL_PORT_PATH = '/dev/ttyUSB0'
+
+BROWN_MODEL_PATH = "/home/pi/Desktop/ch/claibrate/brown_hsv_model.npz"
+BOARD_CALIB_PATH = "/home/pi/Desktop/ch/claibrate/board_calibration.npz"
+
+# Color palette
+DARK_BG = (15, 20, 30)
+PANEL_BG = (25, 35, 50)
+ACCENT_COLOR = (70, 200, 200)
+HIGHLIGHT_COLOR = (100, 220, 255)
+TEXT_COLOR = (230, 240, 255)
+BUTTON_COLOR = (50, 130, 180)
+BUTTON_HOVER = (80, 180, 220)
+ERROR_COLOR = (220, 100, 100)
+SUCCESS_COLOR = (100, 220, 140)
+WARNING_COLOR = (255, 200, 80)
+ILLEGAL_MOVE_COLOR = (220, 80, 80)
+MOVE_HIGHLIGHT = (100, 200, 100, 100)
+
+# Global screen dimensions (will be set by init_pygame)
+SCREEN_WIDTH = 0
+SCREEN_HEIGHT = 0
+
+# ============ Clock / Panel State ============
+# Manual pause toggle (Pause/Resume button)
+manual_paused = False
+pause_start_time = None
+
+# Panel button rects (updated every frame)
+start_btn_rect = None
+reset_btn_rect = None
+
+# Robot-move timing deferral: finalize the robot's move time *after* MOVE_DONE
+awaiting_robot_done = False
+pending_robot_move_num = None
+
+# Dynamic font scaling
+def init_fonts(scale_factor=1.0):
+    return {
+        'title': p.font.SysFont("Arial", int(52 * scale_factor), bold=True),
+        'subtitle': p.font.SysFont("Arial", int(36 * scale_factor), bold=True),
+        'normal': p.font.SysFont("Arial", int(28 * scale_factor)),
+        'small': p.font.SysFont("Arial", int(22 * scale_factor)),
+        'move_list': p.font.SysFont("Courier", int(24 * scale_factor))
+    }
+
+def init_pygame():
+    """Initialize pygame with fullscreen"""
+    global SCREEN_WIDTH, SCREEN_HEIGHT
+    
+    sys.stdout = open(os.devnull, 'w')
+    p.init()
+    sys.stdout = sys.__stdout__
+    
+    # Get display info for fullscreen
+    info = p.display.Info()
+    SCREEN_WIDTH = info.current_w
+    SCREEN_HEIGHT = info.current_h
+    
+    screen = p.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), p.FULLSCREEN)
+    p.display.set_caption('Chess Navigator Pro')
+    
+    # Use the smaller dimension to maintain square aspect ratio for chess board
+    SQ_SIZE = min(SCREEN_WIDTH, SCREEN_HEIGHT) // DIMENSION
+    
+    return screen, SCREEN_WIDTH, SCREEN_HEIGHT, SQ_SIZE
+
+# --- Load Images ---
+def loadImages(SQ_SIZE):
+    pieces = ["wp", "wR", "wN", "wB", "wQ", "wK", "bp", "bR", "bN", "bB", "bQ", "bK"]
+    for piece in pieces:
+        try:
+            IMAGES[piece] = p.transform.scale(
+                p.image.load(f"images/{piece}.png"), (SQ_SIZE, SQ_SIZE))
+        except:
+            # Create fallback piece images
+            surf = p.Surface((SQ_SIZE, SQ_SIZE), p.SRCALPHA)
+            color = (255, 255, 255) if piece[0] == 'w' else (50, 50, 50)
+            p.draw.circle(surf, color, (SQ_SIZE//2, SQ_SIZE//2), SQ_SIZE//3)
+            text = p.font.SysFont("Arial", SQ_SIZE//2).render(piece[1], True,
+                (0, 0, 0) if piece[0] == 'w' else (200, 200, 200))
+            surf.blit(text, (SQ_SIZE//4, SQ_SIZE//4))
+            IMAGES[piece] = surf
+
+# --- Serial setup ---
+try:
+    ser = serial.Serial(SERIAL_PORT_PATH, 9600, timeout=1)
+    time.sleep(2)
+    print("✅ Serial connected.")
+except Exception as e:
+    print(f"❌ Serial error: {e}")
+    ser = None
+
+def send_serial(*args):
+    if ser and ser.is_open:
+        msg = ','.join(str(arg) for arg in args) + '\n'
+        try:
+            ser.write(msg.encode())
+            print(f"📨 Sent to Arduino: {msg.strip()}")
+        except Exception as e:
+            print(f"❌ Serial write error: {e}")
+
+def get_rook_castle_squares(move):
+    if move.pieceMoved == 'wK':
+        if move.endCol == 6:  # White king-side castle
+            return ("h1", "f1")
+        elif move.endCol == 2:  # White queen-side castle
+            return ("a1", "d1")
+    elif move.pieceMoved == 'bK':
+        if move.endCol == 6:  # Black king-side castle
+            return ("h8", "f8")
+        elif move.endCol == 2:  # Black queen-side castle
+            return ("a8", "d8")
+    return ("", "")
+
+def wait_for_move_done(screen, clock, gs, validMoves):
+    """
+    Blocks until Arduino/Nano sends 'MOVE_DONE'. During this wait:
+    - Robot's clock keeps running (thinking + moving time).
+    - When 'MOVE_DONE' arrives, we finalize the robot's move time and
+      start the player's clock from that moment.
+    """
+    global awaiting_robot_done, pending_robot_move_num
+    global lastMoveTimestamp, usedTime, moveTimes
+
+    scale_factor = min(SCREEN_WIDTH, SCREEN_HEIGHT) / 800
+    fonts = init_fonts(scale_factor)
+    waiting = True
+    buffer = ""
+    spinner_angle = 0
+
+    while waiting:
+        for event in p.event.get():
+            if event.type == p.QUIT:
+                p.quit(); sys.exit()
+            elif event.type == p.KEYDOWN:
+                if event.key in (p.K_q, p.K_ESCAPE):
+                    p.quit(); sys.exit()
+
+        if ser and ser.in_waiting:
+            try:
+                data = ser.read(ser.in_waiting).decode(errors='ignore')
+                buffer += data
+                if "MOVE_DONE" in buffer:
+                    # ===== finalize ROBOT timing here =====
+                    if awaiting_robot_done and pending_robot_move_num is not None:
+                        now_t = time.time()
+                        duration = now_t - lastMoveTimestamp
+                        moveTimes[pending_robot_move_num] = max(0.0, duration)
+                        usedTime["black"] += duration  # robot is black side in this app
+                        lastMoveTimestamp = now_t      # start player's clock now
+                        awaiting_robot_done = False
+                        pending_robot_move_num = None
+                    waiting = False
+            except Exception as e:
+                print(f"Error reading serial: {e}")
+
+        drawGameState(screen, gs, validMoves, ())
+
+        # Dark overlay
+        overlay = p.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), p.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))
+        screen.blit(overlay, (0, 0))
+
+        # Card
+        card_width, card_height = int(600 * scale_factor), int(200 * scale_factor)
+        card_x = (SCREEN_WIDTH - card_width) // 2
+        card_y = (SCREEN_HEIGHT - card_height) // 2
+        card = p.Rect(card_x, card_y, card_width, card_height)
+        p.draw.rect(screen, PANEL_BG, card, border_radius=15)
+        p.draw.rect(screen, ACCENT_COLOR, card, 3, border_radius=15)
+
+        text = fonts['title'].render("Robot Arm Moving...", True, HIGHLIGHT_COLOR)
+        screen.blit(text, text.get_rect(center=(card_x + card_width // 2, card_y + int(60 * scale_factor))))
+
+        # Spinner
+        spinner_radius = int(30 * scale_factor)
+        spinner_center = (card_x + card_width // 2, card_y + card_height - int(70 * scale_factor))
+        spinner_angle += 0.1
+        for i in range(8):
+            angle = i * (math.pi / 4) + spinner_angle
+            x = spinner_center[0] + spinner_radius * math.cos(angle)
+            y = spinner_center[1] + spinner_radius * math.sin(angle)
+            size = int((6 + 2 * math.sin(spinner_angle + i)) * scale_factor)
+            color = (HIGHLIGHT_COLOR[0], HIGHLIGHT_COLOR[1], HIGHLIGHT_COLOR[2],
+                    int(200 * (0.5 + 0.5 * math.sin(spinner_angle + i * 0.5))))
+            p.draw.circle(screen, color, (int(x), int(y)), int(size))
+
+        p.display.flip()
+        clock.tick(30)
+
+class Button:
+    def __init__(self, x, y, width, height, text, color=BUTTON_COLOR, hover_color=BUTTON_HOVER, icon=None, disabled=False):
+        self.base_rect = p.Rect(x, y, width, height)
+        self.rect = self.base_rect.copy()
+        self.text = text
+        self.color = color
+        self.hover_color = hover_color
+        self.current_color = color
+        self.hovered = False
+        self.icon = icon
+        self.disabled = disabled
+        self.shadow = p.Rect(x+4, y+4, width, height)
+        self.animation_progress = 0
+        self.pulse_value = 0
+
+    def draw(self, surface, font):
+        shadow_alpha = 100 if self.hovered else 50
+        shadow_surf = p.Surface((self.shadow.width, self.shadow.height), p.SRCALPHA)
+        p.draw.rect(shadow_surf, (0, 0, 0, shadow_alpha), shadow_surf.get_rect(), border_radius=10)
+        surface.blit(shadow_surf, self.shadow)
+
+        color = (150, 150, 170) if self.disabled else (self.hover_color if self.hovered else self.color)
+
+        if self.hovered and self.animation_progress < 1.0:
+            self.animation_progress = min(1.0, self.animation_progress + 0.1)
+        elif not self.hovered and self.animation_progress > 0.0:
+            self.animation_progress = max(0.0, self.animation_progress - 0.1)
+
+        r = int(color[0] * (0.9 + 0.1 * self.animation_progress))
+        g = int(color[1] * (0.9 + 0.1 * self.animation_progress))
+        b = int(color[2] * (0.9 + 0.1 * self.animation_progress))
+        anim_color = (r, g, b)
+
+        self.pulse_value = (self.pulse_value + 0.05) % (2 * math.pi)
+        pulse_alpha = 30 + 10 * math.sin(self.pulse_value)
+        pulse_surf = p.Surface((self.rect.width, self.rect.height), p.SRCALPHA)
+        p.draw.rect(pulse_surf, (*HIGHLIGHT_COLOR[:3], int(pulse_alpha)), pulse_surf.get_rect(), border_radius=10)
+        surface.blit(pulse_surf, self.rect)
+
+        p.draw.rect(surface, anim_color, self.rect, border_radius=10)
+        p.draw.rect(surface, HIGHLIGHT_COLOR, self.rect, 2, border_radius=10)
+
+        text_color = (200, 200, 200) if self.disabled else TEXT_COLOR
+        text_surf = font.render(self.text, True, text_color)
+        text_rect = text_surf.get_rect(center=(self.rect.centerx, self.rect.centery))
+        surface.blit(text_surf, text_rect)
+
+    def update(self, mouse_pos):
+        if self.disabled:
+            self.hovered = False
+            self.rect = self.base_rect.copy()
+            self.shadow = p.Rect(self.base_rect.x+4, self.base_rect.y+4, self.base_rect.width, self.base_rect.height)
+        else:
+            self.hovered = self.base_rect.collidepoint(mouse_pos)
+            self.rect = self.base_rect.inflate(6, 6) if self.hovered else self.base_rect.copy()
+            self.shadow = p.Rect(self.rect.x+4, self.rect.y+4, self.rect.width, self.rect.height)
+
+class CheckHardwareScreen:
+    def __init__(self, screen):
+        self.screen = screen
+        scale_factor = min(SCREEN_WIDTH, SCREEN_HEIGHT) / 800
+        self.fonts = init_fonts(scale_factor)
+        self.clock = p.time.Clock()
+        self.camera_connected = False
+        self.serial_connected = False
+        
+        btn_w, btn_h = int(300 * scale_factor), int(80 * scale_factor)
+        self.continue_btn = Button(
+            (SCREEN_WIDTH - btn_w) // 2, SCREEN_HEIGHT - int(140 * scale_factor), btn_w, btn_h,
+            "Continue", disabled=True)
+
+    def check_camera(self):
+        cap = cv2.VideoCapture(0)
+        if cap is not None and cap.isOpened():
+            self.camera_connected = True
+            cap.release()
+        else:
+            self.camera_connected = False
+
+    def check_serial(self):
+        try:
+            s = serial.Serial(SERIAL_PORT_PATH, 9600, timeout=1)
+            time.sleep(2)
+            self.serial_connected = s.is_open
+            s.close()
+        except:
+            self.serial_connected = False
+
+    def draw_checkmark(self, surface, x, y, size, color):
+        p.draw.circle(surface, color, (x, y), size, 3)
+        p.draw.line(surface, color, (x - size//2, y), (x, y + size//2), 4)
+        p.draw.line(surface, color, (x, y + size//2), (x + size, y - size//2), 4)
+
+    def draw_cross(self, surface, x, y, size):
+        p.draw.circle(surface, ERROR_COLOR, (x, y), size, 3)
+        offset = size // 1.5
+        p.draw.line(surface, ERROR_COLOR, (x - offset, y - offset), (x + offset, y + offset), 4)
+        p.draw.line(surface, ERROR_COLOR, (x - offset, y + offset), (x + offset, y - offset), 4)
+
+    def run(self):
+        self.check_camera()
+        self.check_serial()
+        running = True
+        
+        scale_factor = min(SCREEN_WIDTH, SCREEN_HEIGHT) / 800
+        particle_system = []
+        for _ in range(50):
+            particle_system.append({
+                'x': np.random.randint(0, SCREEN_WIDTH),
+                'y': np.random.randint(0, SCREEN_HEIGHT),
+                'size': np.random.randint(2, 6),
+                'speed': np.random.uniform(0.5, 2.0),
+                'angle': np.random.uniform(0, 2 * math.pi)
+            })
+
+        while running:
+            dt = self.clock.tick(60) / 1000.0
+            mouse_pos = p.mouse.get_pos()
+            self.continue_btn.disabled = not (self.camera_connected and self.serial_connected)
+            self.continue_btn.update(mouse_pos)
+
+            for event in p.event.get():
+                if event.type == p.QUIT:
+                    p.quit(); sys.exit()
+                elif event.type == p.KEYDOWN:
+                    if event.key in (p.K_ESCAPE, p.K_q):
+                        p.quit(); sys.exit()
+                elif event.type == p.MOUSEBUTTONDOWN:
+                    if not self.continue_btn.disabled and self.continue_btn.rect.collidepoint(event.pos):
+                        return True
+
+            # Background
+            self.screen.fill(DARK_BG)
+            for particle in particle_system:
+                particle['x'] += math.cos(particle['angle']) * particle['speed']
+                particle['y'] += math.sin(particle['angle']) * particle['speed']
+                if particle['x'] < 0: particle['x'] = SCREEN_WIDTH
+                if particle['x'] > SCREEN_WIDTH: particle['x'] = 0
+                if particle['y'] < 0: particle['y'] = SCREEN_HEIGHT
+                if particle['y'] > SCREEN_HEIGHT: particle['y'] = 0
+                alpha = min(255, int(100 + 100 * math.sin(p.time.get_ticks() * 0.001)))
+                color = (HIGHLIGHT_COLOR[0], HIGHLIGHT_COLOR[1], HIGHLIGHT_COLOR[2], alpha)
+                p.draw.circle(self.screen, color, (int(particle['x']), int(particle['y'])), particle['size'])
+
+            # Card
+            card_width, card_height = int(700 * scale_factor), int(500 * scale_factor)
+            card_x = (SCREEN_WIDTH - card_width) // 2
+            card_y = (SCREEN_HEIGHT - card_height) // 2 - int(50 * scale_factor)
+            card = p.Rect(card_x, card_y, card_width, card_height)
+            p.draw.rect(self.screen, PANEL_BG, card, border_radius=20)
+            p.draw.rect(self.screen, ACCENT_COLOR, card, 3, border_radius=20)
+
+            title = self.fonts['title'].render("Hardware Check", True, HIGHLIGHT_COLOR)
+            self.screen.blit(title, (card_x + card_width//2 - title.get_width()//2, card_y + int(30 * scale_factor)))
+
+            # Status boxes
+            box_width, box_height = int(550 * scale_factor), int(100 * scale_factor)
+            box_y = card_y + int(120 * scale_factor)
+
+            cam_box = p.Rect(card_x + (card_width - box_width)//2, box_y, box_width, box_height)
+            p.draw.rect(self.screen, (35, 45, 60), cam_box, border_radius=15)
+            p.draw.rect(self.screen, ACCENT_COLOR, cam_box, 2, border_radius=15)
+
+            cam_text = "Camera: Connected" if self.camera_connected else "Camera: NOT detected"
+            cam_color = SUCCESS_COLOR if self.camera_connected else ERROR_COLOR
+            cam_surf = self.fonts['subtitle'].render(cam_text, True, cam_color)
+            cam_rect = cam_surf.get_rect(midleft=(cam_box.x + int(30 * scale_factor), cam_box.y + box_height // 2))
+            self.screen.blit(cam_surf, cam_rect)
+
+            icon_x = cam_box.x + box_width - int(50 * scale_factor)
+            icon_y = cam_box.y + box_height // 2
+            if self.camera_connected:
+                self.draw_checkmark(self.screen, icon_x, icon_y, int(25 * scale_factor), SUCCESS_COLOR)
+            else:
+                self.draw_cross(self.screen, icon_x, icon_y, int(25 * scale_factor))
+
+            serial_box = p.Rect(card_x + (card_width - box_width)//2, box_y + box_height + int(20 * scale_factor), box_width, box_height)
+            p.draw.rect(self.screen, (35, 45, 60), serial_box, border_radius=15)
+            p.draw.rect(self.screen, ACCENT_COLOR, serial_box, 2, border_radius=15)
+
+            serial_text = f"Serial Port: Connected" if self.serial_connected else f"Serial Port: NOT detected"
+            serial_color = SUCCESS_COLOR if self.serial_connected else ERROR_COLOR
+            serial_surf = self.fonts['subtitle'].render(serial_text, True, serial_color)
+            serial_rect = serial_surf.get_rect(midleft=(serial_box.x + int(30 * scale_factor), serial_box.y + box_height // 2))
+            self.screen.blit(serial_surf, serial_rect)
+
+            icon_x_s = serial_box.x + box_width - int(50 * scale_factor)
+            icon_y_s = serial_box.y + box_height // 2
+            if self.serial_connected:
+                self.draw_checkmark(self.screen, icon_x_s, icon_y_s, int(25 * scale_factor), SUCCESS_COLOR)
+            else:
+                self.draw_cross(self.screen, icon_x_s, icon_y_s, int(25 * scale_factor))
+
+            info_text = "Please connect missing hardware and restart if necessary."
+            info_surf = self.fonts['small'].render(info_text, True, TEXT_COLOR)
+            info_rect = info_surf.get_rect(center=(card_x + card_width//2, box_y + box_height*2 + int(50 * scale_factor)))
+            self.screen.blit(info_surf, info_rect)
+
+            self.continue_btn.draw(self.screen, self.fonts['subtitle'])
+            p.display.flip()
+            self.clock.tick(30)
+
+def getPlayerName(screen):
+    scale_factor = min(SCREEN_WIDTH, SCREEN_HEIGHT) / 800
+    fonts = init_fonts(scale_factor)
+    clock = p.time.Clock()
+
+    input_width, input_height = int(600 * scale_factor), int(80 * scale_factor)
+    input_box = p.Rect(SCREEN_WIDTH // 2 - input_width // 2, SCREEN_HEIGHT // 2, input_width, input_height)
+    active = True
+    name = ""
+    cursor_visible = True
+    cursor_timer = 0
+
+    continue_btn = Button(SCREEN_WIDTH // 2 - int(150 * scale_factor), SCREEN_HEIGHT // 2 + int(120 * scale_factor), 
+                         int(300 * scale_factor), int(80 * scale_factor), "Continue", disabled=True)
+
+    # Background animation
+    particles = []
+    for _ in range(100):
+        particles.append({
+            'x': np.random.randint(0, SCREEN_WIDTH),
+            'y': np.random.randint(0, SCREEN_HEIGHT),
+            'size': np.random.randint(2, 6),
+            'speed': np.random.uniform(0.5, 2.0),
+            'angle': np.random.uniform(0, 2 * math.pi),
+            'color': (np.random.randint(50, 100), np.random.randint(150, 200), np.random.randint(200, 255))
+        })
+
+    while active:
+        dt = clock.tick(60) / 1000.0
+        cursor_timer += dt
+        if cursor_timer > 0.5:
+            cursor_visible = not cursor_visible
+            cursor_timer = 0
+
+        for event in p.event.get():
+            if event.type == p.QUIT:
+                p.quit(); sys.exit()
+            elif event.type == p.KEYDOWN:
+                if event.key in (p.K_ESCAPE, p.K_q):
+                    p.quit(); sys.exit()
+                if event.key == p.K_RETURN and name.strip() != "":
+                    active = False
+                elif event.key == p.K_BACKSPACE:
+                    name = name[:-1]
+                else:
+                    if event.unicode.isprintable() and len(name) < 20:
+                        name += event.unicode
+            elif event.type == p.MOUSEBUTTONDOWN:
+                if continue_btn.rect.collidepoint(event.pos) and name.strip() != "":
+                    active = False
+
+        # Update button
+        continue_btn.disabled = name.strip() == ""
+        mouse_pos = p.mouse.get_pos()
+        continue_btn.update(mouse_pos)
+
+        # Draw background
+        screen.fill(DARK_BG)
+        for particle in particles:
+            particle['x'] += math.cos(particle['angle']) * particle['speed'] * dt * 60
+            particle['y'] += math.sin(particle['angle']) * particle['speed'] * dt * 60
+            if particle['x'] < 0: particle['x'] = SCREEN_WIDTH
+            if particle['x'] > SCREEN_WIDTH: particle['x'] = 0
+            if particle['y'] < 0: particle['y'] = SCREEN_HEIGHT
+            if particle['y'] > SCREEN_HEIGHT: particle['y'] = 0
+            p.draw.circle(screen, particle['color'], (int(particle['x']), int(particle['y'])), particle['size'])
+
+        # Card
+        card_width, card_height = int(900 * scale_factor), int(550 * scale_factor)
+        card_x = (SCREEN_WIDTH - card_width) // 2
+        card_y = (SCREEN_HEIGHT - card_height) // 2 - int(50 * scale_factor)
+        card = p.Rect(card_x, card_y, card_width, card_height)
+        p.draw.rect(screen, PANEL_BG, card, border_radius=20)
+        p.draw.rect(screen, ACCENT_COLOR, card, 3, border_radius=20)
+
+        title = fonts['title'].render("Chess Navigator Pro", True, HIGHLIGHT_COLOR)
+        screen.blit(title, (card_x + card_width//2 - title.get_width()//2, card_y + int(40 * scale_factor)))
+
+        prompt = fonts['subtitle'].render("Enter Your Name:", True, TEXT_COLOR)
+        screen.blit(prompt, (card_x + card_width//2 - prompt.get_width()//2, card_y + int(120 * scale_factor)))
+
+        p.draw.rect(screen, (40, 50, 70), input_box, border_radius=12)
+        p.draw.rect(screen, HIGHLIGHT_COLOR, input_box, 3, border_radius=12)
+
+        name_surface = fonts['subtitle'].render(name, True, TEXT_COLOR)
+        screen.blit(name_surface, (input_box.x + int(20 * scale_factor), input_box.y + input_height // 2 - name_surface.get_height() // 2))
+
+        if cursor_visible and active:
+            cursor_x = input_box.x + int(20 * scale_factor) + name_surface.get_width()
+            p.draw.line(screen, HIGHLIGHT_COLOR, (cursor_x, input_box.y + int(15 * scale_factor)),
+                        (cursor_x, input_box.y + input_height - int(15 * scale_factor)), 3)
+
+        continue_btn.draw(screen, fonts['subtitle'])
+        p.display.flip()
+
+    return name.strip()
+
+def getDifficultyChoice(screen, player_name):
+    scale_factor = min(SCREEN_WIDTH, SCREEN_HEIGHT) / 800
+    fonts = init_fonts(scale_factor)
+    clock = p.time.Clock()
+
+    button_width, button_height = int(360 * scale_factor), int(160 * scale_factor)
+    start_y = SCREEN_HEIGHT // 2 - button_height // 2 + int(30 * scale_factor)
+
+    easy_btn = Button(SCREEN_WIDTH // 4 - button_width // 2, start_y, button_width, button_height, "Easy Mode")
+    hard_btn = Button(3 * SCREEN_WIDTH // 4 - button_width // 2, start_y, button_width, button_height, "Hard Mode")
+
+    particles = []
+    for _ in range(50):
+        particles.append({
+            'x': np.random.randint(0, SCREEN_WIDTH),
+            'y': np.random.randint(0, SCREEN_HEIGHT),
+            'size': np.random.randint(2, 6),
+            'speed': np.random.uniform(0.5, 2.0),
+            'angle': np.random.uniform(0, 2 * math.pi)
+        })
+
+    while True:
+        dt = clock.tick(60) / 1000.0
+        mouse_pos = p.mouse.get_pos()
+        easy_btn.update(mouse_pos)
+        hard_btn.update(mouse_pos)
+
+        for event in p.event.get():
+            if event.type == p.QUIT:
+                p.quit(); sys.exit()
+            elif event.type == p.KEYDOWN:
+                if event.key in (p.K_ESCAPE, p.K_q):
+                    p.quit(); sys.exit()
+                elif event.key == p.K_e:
+                    return "easy"
+                elif event.key == p.K_h:
+                    return "hard"
+            elif event.type == p.MOUSEBUTTONDOWN:
+                if easy_btn.rect.collidepoint(event.pos): return "easy"
+                if hard_btn.rect.collidepoint(event.pos): return "hard"
+
+        # Background
+        screen.fill(DARK_BG)
+        for particle in particles:
+            particle['x'] += math.cos(particle['angle']) * particle['speed'] * dt * 60
+            particle['y'] += math.sin(particle['angle']) * particle['speed'] * dt * 60
+            if particle['x'] < 0: particle['x'] = SCREEN_WIDTH
+            if particle['x'] > SCREEN_WIDTH: particle['x'] = 0
+            if particle['y'] < 0: particle['y'] = SCREEN_HEIGHT
+            if particle['y'] > SCREEN_HEIGHT: particle['y'] = 0
+            p.draw.circle(screen, HIGHLIGHT_COLOR, (int(particle['x']), int(particle['y'])), particle['size'])
+
+        # Card
+        card_width, card_height = int(1300 * scale_factor), int(500 * scale_factor)
+        card_x = (SCREEN_WIDTH - card_width) // 2
+        card_y = int(100 * scale_factor)
+        card = p.Rect(card_x, card_y, card_width, card_height)
+        p.draw.rect(screen, PANEL_BG, card, border_radius=20)
+        p.draw.rect(screen, ACCENT_COLOR, card, 3, border_radius=20)
+
+        welcome_text = fonts['title'].render(f"Welcome, {player_name}!", True, HIGHLIGHT_COLOR)
+        screen.blit(welcome_text, (card_x + card_width//2 - welcome_text.get_width()//2, card_y + int(40 * scale_factor)))
+
+        subtitle = fonts['subtitle'].render("Select Game Difficulty", True, TEXT_COLOR)
+        screen.blit(subtitle, (card_x + card_width//2 - subtitle.get_width()//2, card_y + int(120 * scale_factor)))
+
+        easy_btn.draw(screen, fonts['subtitle'])
+        hard_btn.draw(screen, fonts['subtitle'])
+
+        easy_desc = fonts['normal'].render("Perfect for beginners", True, TEXT_COLOR)
+        screen.blit(easy_desc, (easy_btn.rect.centerx - easy_desc.get_width() // 2, easy_btn.rect.bottom + int(15 * scale_factor)))
+
+        hard_desc = fonts['normal'].render("Challenge the AI", True, TEXT_COLOR)
+        screen.blit(hard_desc, (hard_btn.rect.centerx - hard_desc.get_width() // 2, hard_btn.rect.bottom + int(15 * scale_factor)))
+
+        p.display.flip()
+
+def check_initial_pieces(screen, camera, warp_matrix, square_names,
+                        lower_hsv_brown, upper_hsv_brown,
+                        fonts):
+    grid_rows, grid_cols = 8, 8
+    scale_factor = min(SCREEN_WIDTH, SCREEN_HEIGHT) / 800
+    board_size = int(480 * scale_factor)
+    square_size = board_size // grid_rows
+    board_x = (SCREEN_WIDTH - board_size) // 2
+    board_y = (SCREEN_HEIGHT - board_size) // 2 - int(50 * scale_factor)
+
+    continue_btn = Button(SCREEN_WIDTH // 2 - int(150 * scale_factor), SCREEN_HEIGHT - int(120 * scale_factor), 
+                         int(300 * scale_factor), int(80 * scale_factor), "Continue", disabled=True)
+
+    required_white = ["a1","b1","c1","d1","e1","f1","g1","h1","a2","b2","c2","d2","e2","f2","g2","h2"]
+    required_black = ["a7","b7","c7","d7","e7","f7","g7","h7","a8","b8","c8","d8","e8","f8","g8","h8"]
+
+    lower_hsv_black = np.array([0, 0, 0])
+    upper_hsv_black = np.array([180, 255, 50])
+
+    while True:
+        frame = camera.capture_array()
+        warped = cv2.warpPerspective(frame, warp_matrix, (480, 480))
+        warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
+        warped_surface = p.image.frombuffer(warped_rgb.tobytes(), (480, 480), 'RGB')
+        warped_surface = p.transform.smoothscale(warped_surface, (board_size, board_size))
+
+        hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
+        mask_brown = cv2.inRange(hsv, lower_hsv_brown, upper_hsv_brown)
+        mask_black = cv2.inRange(hsv, lower_hsv_black, upper_hsv_black)
+
+        brown_present = []
+        black_present = []
+
+        for row in range(grid_rows):
+            for col in range(grid_cols):
+                x = col * (480 // grid_cols)
+                y = row * (480 // grid_rows)
+                square_w = 480 // grid_cols
+                square_h = 480 // grid_rows
+
+                brown_mask_sq = mask_brown[y:y + square_h, x:x + square_w]
+                brown_percent = cv2.countNonZero(brown_mask_sq) / (square_w * square_h)
+
+                black_mask_sq = mask_black[y:y + square_h, x:x + square_w]
+                black_percent = cv2.countNonZero(black_mask_sq) / (square_w * square_h)
+
+                sq_name = square_names[row][col]
+                if brown_percent > 0.05: brown_present.append(sq_name)
+                if black_percent > 0.05: black_present.append(sq_name)
+
+        all_brown_present = all(sq in brown_present for sq in required_white)
+        all_black_present = all(sq in black_present for sq in required_black)
+
+        pieces_ok = all_brown_present and all_black_present
+        continue_btn.disabled = not pieces_ok
+        mouse_pos = p.mouse.get_pos()
+        continue_btn.update(mouse_pos)
+
+        # Draw UI
+        screen.fill(DARK_BG)
+        card_width, card_height = SCREEN_WIDTH - int(100 * scale_factor), SCREEN_HEIGHT - int(200 * scale_factor)
+        card_x, card_y = int(50 * scale_factor), int(50 * scale_factor)
+        card = p.Rect(card_x, card_y, card_width, card_height)
+        p.draw.rect(screen, PANEL_BG, card, border_radius=20)
+        p.draw.rect(screen, ACCENT_COLOR, card, 3, border_radius=20)
+
+        title_surf = fonts['title'].render("Initial Piece Setup", True, HIGHLIGHT_COLOR)
+        screen.blit(title_surf, (card_x + card_width//2 - title_surf.get_width()//2, card_y ))
+
+        screen.blit(warped_surface, (board_x, board_y))
+
+        light_color = p.Color(238, 238, 210)
+        dark_color = p.Color(118, 150, 86)
+        for row in range(grid_rows):
+            for col in range(grid_cols):
+                rect = p.Rect(board_x + col * square_size, board_y + row * square_size, square_size, square_size)
+                color = light_color if (row + col) % 2 == 0 else dark_color
+                p.draw.rect(screen, color, rect)
+
+        for sq in required_white:
+            for row in range(grid_rows):
+                for col in range(grid_cols):
+                    if square_names[row][col] == sq:
+                        rect = p.Rect(board_x + col * square_size, board_y + row * square_size, square_size, square_size)
+                        p.draw.rect(screen, WARNING_COLOR, rect, 3, border_radius=6)
+
+        for sq in required_black:
+            for row in range(grid_rows):
+                for col in range(grid_cols):
+                    if square_names[row][col] == sq:
+                        rect = p.Rect(board_x + col * square_size, board_y + row * square_size, square_size, square_size)
+                        p.draw.rect(screen, ACCENT_COLOR, rect, 3, border_radius=6)
+
+        for msq in [sq for sq in required_white if sq not in brown_present]:
+            for row in range(grid_rows):
+                for col in range(grid_cols):
+                    if square_names[row][col] == msq:
+                        rect = p.Rect(board_x + col * square_size, board_y + row * square_size, square_size, square_size)
+                        p.draw.rect(screen, ERROR_COLOR, rect, 4, border_radius=8)
+
+        for msq in [sq for sq in required_black if sq not in black_present]:
+            for row in range(grid_rows):
+                for col in range(grid_cols):
+                    if square_names[row][col] == msq:
+                        rect = p.Rect(board_x + col * square_size, board_y + row * square_size, square_size, square_size)
+                        p.draw.rect(screen, (180, 80, 220), rect, 4, border_radius=8)
+
+        status_y = board_y + board_size + int(20 * scale_factor)
+        if not pieces_ok:
+            lines = [
+                "Place all brown pieces on starting squares (yellow outline)",
+                "Place all black pieces on starting squares (blue outline)",
+                "Press 'Q' to quit anytime."
+            ]
+            for i, line in enumerate(lines):
+                text = fonts['normal'].render(line, True, TEXT_COLOR)
+                screen.blit(text, (card_x + card_width//2 - text.get_width()//2, status_y + i * int(35 * scale_factor)))
+        else:
+            text = fonts['subtitle'].render("All pieces detected! Press Continue", True, SUCCESS_COLOR)
+            screen.blit(text, (card_x + card_width//2 - text.get_width()//2, status_y))
+
+        continue_btn.draw(screen, fonts['subtitle'])
+        p.display.flip()
+
+        proceed = False
+        for event in p.event.get():
+            if event.type == p.QUIT: p.quit(); sys.exit()
+            elif event.type == p.KEYDOWN:
+                if event.key in (p.K_q, p.K_ESCAPE): p.quit(); sys.exit()
+                if event.key == p.K_RETURN and pieces_ok: proceed = True
+            elif event.type == p.MOUSEBUTTONDOWN:
+                if continue_btn.base_rect.collidepoint(event.pos) and not continue_btn.disabled:
+                    proceed = True
+
+        if pieces_ok and proceed: break
+
+def drawBoard(screen, SQ_SIZE):
+    colors = [p.Color(238, 238, 210), p.Color(118, 150, 86)]
+    board_width = SQ_SIZE * DIMENSION
+    board_height = SQ_SIZE * DIMENSION
+    board_x = (SCREEN_WIDTH - board_width) // 2 - int(100 * min(SCREEN_WIDTH, SCREEN_HEIGHT) / 800)
+    board_y = (SCREEN_HEIGHT - board_height) // 2
+
+    board_surface = p.Surface((board_width, board_height))
+    for row in range(DIMENSION):
+        for col in range(DIMENSION):
+            color = colors[(row + col) % 2]
+            p.draw.rect(board_surface, color, p.Rect(col * SQ_SIZE, row * SQ_SIZE, SQ_SIZE, SQ_SIZE))
+
+    screen.blit(board_surface, (board_x, board_y))
+    return board_x, board_y
+
+def drawPieces(screen, gs, board_x, board_y, SQ_SIZE):
+    for row in range(DIMENSION):
+        for col in range(DIMENSION):
+            piece = gs.board[row][col]
+            if piece != "--":
+                screen.blit(IMAGES[piece], p.Rect(board_x + col * SQ_SIZE, board_y + row * SQ_SIZE, SQ_SIZE, SQ_SIZE))
+
+# Global timing data
+moveTimes = {}
+lastMoveTimestamp = time.time()
+totalTime = {"white": 10 * 60, "black": 10 * 60}  # 10 min each
+usedTime = {"white": 0, "black": 0}
+
+def format_time(seconds):
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0: return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+def compute_remaining_times(gs):
+    """Return (white_rem, black_rem) considering manual pause and live turn."""
+    current_side = "white" if gs.whiteToMove else "black"
+    live_elapsed = 0.0 if manual_paused else (time.time() - lastMoveTimestamp)
+    white_rem = totalTime["white"] - usedTime["white"] - (live_elapsed if current_side == "white" else 0)
+    black_rem = totalTime["black"] - usedTime["black"] - (live_elapsed if current_side == "black" else 0)
+    return max(0, int(white_rem)), max(0, int(black_rem))
+
+# =======================
+# Redesigned Game Info Panel
+# =======================
+def drawGameState(screen, gs, validMoves, illegal_move=None):
+    """Only this screen is redesigned; all logic and other screens unchanged."""
+    global lastMoveTimestamp, moveTimes, totalTime, usedTime
+    global start_btn_rect, reset_btn_rect
+
+    # === Background gradient ===
+    screen.fill(DARK_BG)
+    for i in range(SCREEN_HEIGHT):
+        alpha = i / SCREEN_HEIGHT
+        color = (
+            int(DARK_BG[0] * (1 - alpha) + ACCENT_COLOR[0] * alpha * 0.15),
+            int(DARK_BG[1] * (1 - alpha) + ACCENT_COLOR[1] * alpha * 0.15),
+            int(DARK_BG[2] * (1 - alpha) + ACCENT_COLOR[2] * alpha * 0.15)
+        )
+        p.draw.line(screen, color, (0, i), (SCREEN_WIDTH, i))
+
+    # === Board & Pieces ===
+    SQ_SIZE = min(SCREEN_WIDTH, SCREEN_HEIGHT) // DIMENSION
+    board_x, board_y = drawBoard(screen, SQ_SIZE)
+    drawPieces(screen, gs, board_x, board_y, SQ_SIZE)
+
+    # === Finalize HUMAN move time immediately when move logged ===
+    if len(gs.moveLog) > len(moveTimes):
+        move_num = len(gs.moveLog)
+        if not (awaiting_robot_done and pending_robot_move_num == move_num):
+            now = time.time()
+            duration = now - lastMoveTimestamp
+            moveTimes[move_num] = max(0.0, duration)
+
+            if move_num % 2 == 1:  # white (player) moved
+                usedTime["white"] += duration
+            else:  # robot move
+                usedTime["black"] += duration
+
+            lastMoveTimestamp = now
+
+    # === Illegal move highlight ===
+    if illegal_move:
+        start_row, start_col = illegal_move.startRow, illegal_move.startCol
+        end_row, end_col = illegal_move.endRow, illegal_move.endCol
+        start_rect = p.Rect(board_x + start_col * SQ_SIZE,
+                            board_y + start_row * SQ_SIZE, SQ_SIZE, SQ_SIZE)
+        end_rect = p.Rect(board_x + end_col * SQ_SIZE,
+                          board_y + end_row * SQ_SIZE, SQ_SIZE, SQ_SIZE)
+        p.draw.rect(screen, ILLEGAL_MOVE_COLOR, start_rect, 4, border_radius=5)
+        p.draw.rect(screen, ILLEGAL_MOVE_COLOR, end_rect, 4, border_radius=5)
+        p.draw.line(screen, ILLEGAL_MOVE_COLOR, start_rect.center, end_rect.center, 3)
+
+    # === Right Panel ===
+    scale = min(SCREEN_WIDTH, SCREEN_HEIGHT) / 930
+    fonts = init_fonts(scale)
+
+    panel_width = int(440 * scale)
+    panel_height = SCREEN_HEIGHT - int(30 * scale)
+    panel_x = SCREEN_WIDTH - panel_width - int(20 * scale)
+    panel_y = int(20 * scale)
+    panel = p.Rect(panel_x, panel_y, panel_width, panel_height)
+    p.draw.rect(screen, PANEL_BG, panel, border_radius=16)
+    p.draw.rect(screen, (30, 45, 65), panel, 2, border_radius=16)
+
+    # === Header ===
+    header_h = int(170 * scale)
+    header_rect = p.Rect(panel_x, panel_y, panel_width, header_h)
+    header_grad = p.Surface((panel_width, header_h), p.SRCALPHA)
+    header_grad.fill((40, 55, 80, 240))
+    screen.blit(header_grad, (panel_x, panel_y))
+    p.draw.rect(screen, (70, 100, 130), header_rect, 2, border_radius=16)
+
+    title = fonts['subtitle'].render("Chess Navigator", True, HIGHLIGHT_COLOR)
+    screen.blit(title, (panel_x + int(12*scale)+60, panel_y + int(10*scale)+15))
+
+    # === Player info row ===
+    info_y = panel_y + int(60*scale)
+    info_text = fonts['normal'].render(
+        f"Player: {player_name} • Difficulty: {difficulty.capitalize()}",
+        True, TEXT_COLOR
+    )
+    screen.blit(info_text, (panel_x + int(12*scale)+30, info_y+80))
+
+    # === Buttons ===
+    btn_w, btn_h = int(100 * scale), int(36 * scale)
+    gap = int(10 * scale)
+    start_btn_rect = p.Rect(panel_x + panel_width - btn_w*2 - gap*2-150,
+                            panel_y + int(14*scale)+65, btn_w, btn_h)
+    reset_btn_rect = p.Rect(panel_x + panel_width - btn_w - gap-150,
+                            panel_y + int(14*scale)+65, btn_w, btn_h)
+
+    mouse_pos = p.mouse.get_pos()
+
+    def draw_header_button(rect, label, active=False):
+        hovered = rect.collidepoint(mouse_pos)
+        bg = (55, 75, 110) if not hovered else (65, 95, 135)
+        if active: bg = (80, 140, 100) if not hovered else (90, 160, 120)
+        p.draw.rect(screen, bg, rect, border_radius=10)
+        p.draw.rect(screen, (120, 160, 200), rect, 2, border_radius=10)
+        t = fonts['small'].render(label, True, TEXT_COLOR)
+        screen.blit(t, t.get_rect(center=rect.center))
+
+    draw_header_button(start_btn_rect, "Pause" if not manual_paused else "Resume",
+                       active=(not manual_paused))
+    draw_header_button(reset_btn_rect, "Reset", active=False)
+
+    # === Timers Card ===
+    card_margin = int(12 * scale)
+    card_x = panel_x + card_margin
+    card_y = panel_y + header_h + card_margin
+    card_w = panel_width - card_margin*2
+    card_h = int(230 * scale)
+    card = p.Rect(card_x, card_y, card_w, card_h)
+    p.draw.rect(screen, (33, 45, 66), card, border_radius=14)
+    p.draw.rect(screen, (70, 100, 130), card, 1, border_radius=14)
+
+    # === Remaining times ===
+    white_rem, black_rem = compute_remaining_times(gs)
+    current_side = "white" if gs.whiteToMove else "black"
+
+    inner_pad = int(14 * scale)
+    row_h = int(100 * scale)
+    player_rect = p.Rect(card_x + inner_pad, card_y + inner_pad, card_w - inner_pad*2, row_h)
+    robot_rect = p.Rect(card_x + inner_pad, player_rect.bottom + int(12*scale),
+                        card_w - inner_pad*2, row_h)
+
+    def draw_clock(rect, label, time_val, accent_color, active):
+        glow = 8 if active else 3
+        shadow = p.Surface((rect.width+glow*2, rect.height+glow*2), p.SRCALPHA)
+        p.draw.rect(shadow, (*accent_color, 40), shadow.get_rect(), border_radius=14)
+        screen.blit(shadow, (rect.x-glow, rect.y-glow))
+        p.draw.rect(screen, (28, 38, 58), rect, border_radius=12)
+        p.draw.rect(screen, accent_color, rect, 2, border_radius=12)
+
+        hdr = fonts['small'].render(label, True, accent_color)
+        screen.blit(hdr, (rect.x + int(12*scale), rect.y + int(8*scale)))
+
+        big = fonts['subtitle'].render(format_time(time_val), True, TEXT_COLOR)
+        screen.blit(big, (rect.x + int(12*scale), rect.y + int(40*scale)))
+
+        total = totalTime["white"]
+        frac = max(0.0, min(1.0, time_val / total)) if total > 0 else 0.0
+        bar_w = rect.width - int(24*scale)
+        bar_h = int(12*scale)
+        bar_x = rect.x + int(12*scale)
+        bar_y = rect.bottom - int(18*scale)
+        p.draw.rect(screen, (45, 55, 80), (bar_x, bar_y, bar_w, bar_h), border_radius=6)
+        fill_w = int(bar_w * frac)
+        p.draw.rect(screen, accent_color, (bar_x, bar_y, fill_w, bar_h), border_radius=6)
+        p.draw.rect(screen, (20, 28, 38), (bar_x, bar_y, bar_w, bar_h), 2, border_radius=6)
+
+    draw_clock(player_rect, "PLAYER TURN", white_rem, (139,69,19),
+               active=(current_side == "white" and not manual_paused))
+    draw_clock(robot_rect, "ROBOT TURN", black_rem, (130,30,30),
+               active=(current_side == "black" and not manual_paused))
+
+    # === Turn Banner with animation + status ===
+    banner_h = int(120 * scale)
+    banner_rect = p.Rect(card_x, card.bottom + card_margin, card_w, banner_h)
+    p.draw.rect(screen, (33, 45, 66), banner_rect, border_radius=14)
+    p.draw.rect(screen, (70, 100, 130), banner_rect, 1, border_radius=14)
+
+    # Gradient background
+    banner_bg = p.Surface((banner_rect.width, banner_rect.height))
+    for y in range(banner_rect.height):
+        r = int(12 + (32 - 12) * (y / banner_rect.height))
+        g = int(20 + (42 - 20) * (y / banner_rect.height))
+        b = int(27 + (56 - 27) * (y / banner_rect.height))
+        p.draw.line(banner_bg, (r, g, b), (0, y), (banner_rect.width, y))
+    screen.blit(banner_bg, banner_rect.topleft)
+
+    # Smooth dark glow overlay
+    blink_surface = p.Surface((banner_rect.width, banner_rect.height), p.SRCALPHA)
+    time_ms = p.time.get_ticks()
+    pulse = (math.sin(time_ms * 0.0025) + 1) / 2
+    alpha = int(pulse * 60)
+    blink_color = (20, 30, 45, alpha)
+    p.draw.rect(blink_surface, blink_color, blink_surface.get_rect())
+    screen.blit(blink_surface, banner_rect.topleft, special_flags=p.BLEND_RGBA_ADD)
+
+    # Text Rendering
+    turn_text = "YOUR TURN" if gs.whiteToMove else "ROBOT'S TURN"
+    sub_text = "Make your move" if gs.whiteToMove else "Robot is thinking..."
+
+    base_color = (255,255,255)
+    pulse_strength = int(40 * pulse)
+    lbl_color = (
+        max(100, base_color[0] - pulse_strength),
+        max(100, base_color[1] - pulse_strength),
+        max(120, base_color[2] - pulse_strength)
+    )
+    lbl = fonts['subtitle'].render(turn_text, True, lbl_color)
+    sub = fonts['small'].render(sub_text, True, (160, 160, 170))
+
+    screen.blit(lbl, lbl.get_rect(center=(banner_rect.centerx, banner_rect.y + int(28*scale) + 70)))
+    screen.blit(sub, sub.get_rect(center=(banner_rect.centerx, banner_rect.y + int(55*scale) - 5)))
+
+    # Check indicator
+    status = "CHECK!" if gs.inCheck else "Safe"
+    status_col = ERROR_COLOR if gs.inCheck else (120, 200, 140)
+    status_tag = fonts['small'].render(f"Status: {status}", True, status_col)
+    screen.blit(status_tag, (banner_rect.x + int(12*scale)+150, banner_rect.y + int(12*scale)))
+
+    # === Move History ===
+    hist_top = banner_rect.bottom + card_margin
+    hist_rect = p.Rect(card_x, hist_top, card_w, panel_y + panel_height - hist_top - card_margin)
+    p.draw.rect(screen, (33,45,66), hist_rect, border_radius=14)
+    p.draw.rect(screen, (70,100,130), hist_rect, 1, border_radius=14)
+
+    mh_title = fonts['subtitle'].render("Move History", True, HIGHLIGHT_COLOR)
+    screen.blit(mh_title, (hist_rect.x + int(12*scale)+100, hist_rect.y + int(8*scale)))
+    p.draw.line(screen, (80,110,140),
+                (hist_rect.x + int(12*scale), hist_rect.y + int(42*scale)),
+                (hist_rect.right - int(12*scale), hist_rect.y + int(42*scale)), 1)
+
+    start_index = max(0, len(gs.moveLog) - 10)
+    y = hist_rect.y + int(50*scale)
+    step = int(32*scale)
+    for i, mv in enumerate(gs.moveLog[start_index:], start=start_index+1):
+        a = f"{'abcdefgh'[mv.startCol]}{8-mv.startRow}".upper()
+        b = f"{'abcdefgh'[mv.endCol]}{8-mv.endRow}".upper()
+        label = "Player Move :" if i % 2 == 1 else "Robot Move :"
+        row = p.Rect(hist_rect.x + int(10*scale), y-4, hist_rect.width - int(20*scale), int(28*scale))
+        color_bg = (40, 60, 85) if i % 2 == 1 else (65, 40, 50)
+        p.draw.rect(screen, color_bg, row, border_radius=8)
+        p.draw.rect(screen, (90,120,150) if i%2==1 else (140,90,100), row, 1, border_radius=8)
+        s = fonts['small'].render(f"{i}. {label} {a} -> {b}", True, TEXT_COLOR)
+        screen.blit(s, (row.x + int(10*scale), row.y + int(4*scale)))
+
+        mt = moveTimes.get(i, 0.0)
+        if mt:
+            ttxt = fonts['small'].render(f"{format_time(int(mt))}", True, (200,220,230))
+            screen.blit(ttxt, (row.right - ttxt.get_width() - int(10*scale), row.y + int(4*scale)))
+        y += step
+
+
+
+# ---------------- Camera + move helpers (unchanged) ----------------
+def camera_move_detector(move_queue, picam2, stop_event):
+    CROP_SIZE = 480
+    GRID_ROWS = GRID_COLS = 8
+    SQUARE_SIZE = CROP_SIZE // GRID_ROWS
+    BOARD_CALIB_PATH = "/home/pi/Desktop/ch/claibrate/board_calibration.npz"
+    MAX_AREA = 10000
+    DETECTION_THRESHOLD = 0.05
+    HAND_CLEAR_DELAY = 1.5
+    MOVE_CONFIRM_TIME = 2.0
+
+    try:
+        brown_model = np.load(BROWN_MODEL_PATH)
+        lower_hsv = brown_model["lower"]
+        upper_hsv = brown_model["upper"]
+
+        board_calib = np.load(BOARD_CALIB_PATH, allow_pickle=True)
+        warp_matrix = board_calib["warp_matrix"]
+        square_names = board_calib["square_names"]
+    except Exception as e:
+        print(f"Camera calibration load error: {e}")
+        return
+
+    rgb_gain = np.array([1.0, 1.0, 1.0])
+    last_grid = None
+    change_start = None
+    hand_present = False
+    hand_cleared_time = None
+    move_pending = False
+
+    def apply_rgb_gain(frame, gain):
+        frame = frame.astype(np.float32)
+        for i in range(3):
+            frame[:, :, i] *= gain[i]
+        return np.clip(frame, 0, 255).astype(np.uint8)
+
+    print("♟️ Brown Piece Detection Running in thread...")
+
+    while not stop_event.is_set():
+        try:
+            frame = picam2.capture_array()
+            frame = apply_rgb_gain(frame, rgb_gain)
+            warped = cv2.warpPerspective(frame, warp_matrix, (CROP_SIZE, CROP_SIZE))
+            hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, lower_hsv, upper_hsv)
+
+            now = time.time()
+
+            contours, _ = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            max_area = max([cv2.contourArea(c) for c in contours], default=0)
+
+            if max_area > MAX_AREA:
+                if not hand_present:
+                    print("✋ Hand or obstruction detected — pausing detection...")
+                    hand_present = True
+                    hand_cleared_time = None
+                    move_pending = False
+                    change_start = None
+            else:
+                if hand_present and hand_cleared_time is None:
+                    hand_cleared_time = now
+                elif hand_present and (now - hand_cleared_time > HAND_CLEAR_DELAY):
+                    hand_present = False
+                    print("✅ Hand cleared — resuming detection")
+
+            if not hand_present and hand_cleared_time is not None and (now - hand_cleared_time > HAND_CLEAR_DELAY):
+                new_grid = [[0] * GRID_COLS for _ in range(GRID_ROWS)]
+
+                for row in range(GRID_ROWS):
+                    for col in range(GRID_COLS):
+                        x, y = col * SQUARE_SIZE, row * SQUARE_SIZE
+                        square_mask = mask[y:y + SQUARE_SIZE, x:x + SQUARE_SIZE]
+                        percent = cv2.countNonZero(square_mask) / (SQUARE_SIZE * SQUARE_SIZE)
+                        if percent > DETECTION_THRESHOLD:
+                            new_grid[row][col] = 1
+
+                if last_grid is not None and new_grid != last_grid:
+                    if not move_pending:
+                        move_pending = True
+                        change_start = now
+                    elif (now - change_start) >= MOVE_CONFIRM_TIME:
+                        removed = []
+                        placed = []
+
+                        for i in range(GRID_ROWS):
+                            for j in range(GRID_COLS):
+                                if last_grid[i][j] == 1 and new_grid[i][j] == 0:
+                                    removed.append(square_names[i][j])
+                                elif last_grid[i][j] == 0 and new_grid[i][j] == 1:
+                                    placed.append(square_names[i][j])
+
+                        if len(removed) == 1 and len(placed) == 1:
+                            start_sq, end_sq = removed[0], placed[0]
+                            if (len(start_sq) == 2 and len(end_sq) == 2 and
+                                start_sq[0] in 'abcdefgh' and end_sq[0] in 'abcdefgh' and
+                                start_sq[1] in '12345678' and end_sq[1] in '12345678' and
+                                start_sq != end_sq):
+                                move = (start_sq, end_sq)
+                                print(f"♟️ Move Detected: {move[0]} -> {move[1]}")
+                                try:
+                                    move_queue.put(move, block=False)
+                                except queue.Full:
+                                    print("Move queue full - dropping move")
+                                except Exception as e:
+                                    print(f"Error putting move in queue: {e}")
+
+                        last_grid = [row[:] for row in new_grid]
+                        move_pending = False
+                else:
+                    move_pending = False
+                    change_start = None
+
+                if last_grid is None:
+                    last_grid = [row[:] for row in new_grid]
+
+            time.sleep(0.05)
+
+        except Exception as e:
+            print(f"Camera thread error: {e}")
+            time.sleep(1)
+
+def get_camera_move(gs, camera_move_queue):
+    validMoves = gs.getValidMoves()
+    try:
+        start_sq, end_sq = camera_move_queue.get_nowait()
+        move = build_move(start_sq, end_sq, gs)
+        return move
+    except queue.Empty:
+        return None
+
+def build_move(start_sq, end_sq, gs):
+    try:
+        start_col = 'abcdefgh'.index(start_sq[0])
+        start_row = 8 - int(start_sq[1])
+        end_col = 'abcdefgh'.index(end_sq[0])
+        end_row = 8 - int(end_sq[1])
+
+        for move in gs.getValidMoves():
+            if move.startRow == start_row and move.startCol == start_col and \
+               move.endRow == end_row and move.endCol == end_col:
+                return move
+
+        return Move((start_row, start_col), (end_row, end_col), gs.board)
+    except Exception as e:
+        print(f"Error building move: {e}")
+        return None
+
+def pos_to_alg(row, col):
+    return f"{'abcdefgh'[col]}{8-row}"
+
+def boardToFen(gs):
+    fen = []
+    empty = 0
+
+    for row in range(8):
+        for col in range(8):
+            piece = gs.board[row][col]
+            if piece == "--":
+                empty += 1
+            else:
+                if empty > 0:
+                    fen.append(str(empty))
+                    empty = 0
+                fen.append(piece)
+        if empty > 0:
+            fen.append(str(empty))
+            empty = 0
+        if row < 7:
+            fen.append('/')
+
+    fen.append(' ')
+    fen.append('w' if gs.whiteToMove else 'b')
+    fen.append(' ')
+
+    castling = []
+    if gs.currentCastlingRight.wks: castling.append('K')
+    if gs.currentCastlingRight.wqs: castling.append('Q')
+    if gs.currentCastlingRight.bks: castling.append('k')
+    if gs.currentCastlingRight.bqs: castling.append('q')
+    fen.append(''.join(castling) if castling else '-')
+
+    fen.append(' ')
+    if gs.enPassantPossible != ():
+        row, col = gs.enPassantPossible
+        fen.append(Move.colsToFiles[col] + Move.rowsToRanks[row])
+    else:
+        fen.append('-')
+
+    return ''.join(fen)
+
+def isInsufficientMaterial(board):
+    pieces = {'w': [], 'b': []}
+    for row in range(8):
+        for col in range(8):
+            piece = board[row][col]
+            if piece != "--":
+                color = piece[0]
+                piece_type = piece[1]
+                pieces[color].append(piece_type)
+
+    if len(pieces['w']) == 1 and len(pieces['b']) == 1:
+        return True
+
+    for color in ['w', 'b']:
+        other = 'b' if color == 'w' else 'w'
+        if len(pieces[color]) == 2 and len(pieces[other]) == 1:
+            if any(p in pieces[color] for p in ['B', 'N']):
+                return True
+
+    if (len(pieces['w']) == 2 and len(pieces['b']) == 2 and 'B' in pieces['w'] and 'B' in pieces['b']):
+        bishops = []
+        for row in range(8):
+            for col in range(8):
+                piece = board[row][col]
+                if piece.endswith('B'):
+                    bishops.append((row, col))
+        if len(bishops) == 2:
+            (r1, c1), (r2, c2) = bishops
+            if (r1 + c1) % 2 == (r2 + c2) % 2:
+                return True
+
+    for color in ['w', 'b']:
+        other = 'b' if color == 'w' else 'w'
+        if len(pieces[color]) == 2 and len(pieces[other]) == 1 and 'N' in pieces[color]:
+            return True
+
+    return False
+
+def showEndGameMessage(screen, player_name, white_won):
+    scale_factor = min(SCREEN_WIDTH, SCREEN_HEIGHT) / 800
+    fonts = init_fonts(scale_factor)
+    clock = p.time.Clock()
+    duration = 8000
+
+    overlay = p.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), p.SRCALPHA)
+    overlay.fill((0, 0, 0, 180))
+    screen.blit(overlay, (0, 0))
+
+    card_width, card_height = int(700 * scale_factor), int(400 * scale_factor)
+    card_x = (SCREEN_WIDTH - card_width) // 2
+    card_y = (SCREEN_HEIGHT - card_height) // 2
+    card = p.Rect(card_x, card_y, card_width, card_height)
+    p.draw.rect(screen, PANEL_BG, card, border_radius=20)
+    p.draw.rect(screen, ACCENT_COLOR, card, 3, border_radius=20)
+
+    if white_won:
+        msg = f"Congratulations {player_name}!"
+        submsg = "You won the game!"
+        color = SUCCESS_COLOR
+    else:
+        msg = f"Sorry {player_name}"
+        submsg = "You lost on time. Try again!"
+        color = ERROR_COLOR
+
+    title = fonts['title'].render(msg, True, color)
+    screen.blit(title, (card_x + card_width//2 - title.get_width()//2, card_y + int(80 * scale_factor)))
+
+    subtitle = fonts['subtitle'].render(submsg, True, HIGHLIGHT_COLOR)
+    screen.blit(subtitle, (card_x + card_width//2 - subtitle.get_width()//2, card_y + int(160 * scale_factor)))
+
+    instruction = fonts['normal'].render("Press any key to continue...", True, HIGHLIGHT_COLOR)
+    screen.blit(instruction, (card_x + card_width//2 - instruction.get_width()//2, card_y + int(280 * scale_factor)))
+
+    p.display.flip()
+
+    start_time = p.time.get_ticks()
+    while p.time.get_ticks() - start_time < duration:
+        for event in p.event.get():
+            if event.type == p.QUIT or (event.type == p.KEYDOWN and event.key in (p.K_ESCAPE, p.K_q)):
+                p.quit(); sys.exit()
+            if event.type == p.KEYDOWN or event.type == p.MOUSEBUTTONDOWN:
+                return True
+        clock.tick(30)
+    return True
+
+def play_again_prompt(screen):
+    scale_factor = min(SCREEN_WIDTH, SCREEN_HEIGHT) / 800
+    fonts = init_fonts(scale_factor)
+    clock = p.time.Clock()
+
+    overlay = p.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), p.SRCALPHA)
+    overlay.fill((0, 0, 0, 180))
+    screen.blit(overlay, (0, 0))
+
+    card_width, card_height = int(500 * scale_factor), int(300 * scale_factor)
+    card_x = (SCREEN_WIDTH - card_width) // 2
+    card_y = (SCREEN_HEIGHT - card_height) // 2
+    card = p.Rect(card_x, card_y, card_width, card_height)
+    p.draw.rect(screen, PANEL_BG, card, border_radius=20)
+    p.draw.rect(screen, ACCENT_COLOR, card, 3, border_radius=20)
+
+    title = fonts['title'].render("Game Over", True, HIGHLIGHT_COLOR)
+    screen.blit(title, (card_x + card_width//2 - title.get_width()//2, card_y + int(40 * scale_factor)))
+
+    question = fonts['subtitle'].render("Play again?", True, TEXT_COLOR)
+    screen.blit(question, (card_x + card_width//2 - question.get_width()//2, card_y + int(120 * scale_factor)))
+
+    btn_width, btn_height = int(180 * scale_factor), int(70 * scale_factor)
+    yes_btn = Button(card_x + card_width//4 - btn_width//2, card_y + int(200 * scale_factor), btn_width, btn_height, "Yes")
+    no_btn = Button(card_x + 3*card_width//4 - btn_width//2, card_y + int(200 * scale_factor), btn_width, btn_height, "No")
+
+    while True:
+        mouse_pos = p.mouse.get_pos()
+        yes_btn.update(mouse_pos)
+        no_btn.update(mouse_pos)
+
+        for event in p.event.get():
+            if event.type == p.QUIT: p.quit(); sys.exit()
+            elif event.type == p.KEYDOWN:
+                if event.key in (p.K_q, p.K_ESCAPE): p.quit(); sys.exit()
+                elif event.key == p.K_n: return False
+                elif event.key == p.K_y: return True
+            elif event.type == p.MOUSEBUTTONDOWN:
+                if yes_btn.rect.collidepoint(event.pos): return True
+                if no_btn.rect.collidepoint(event.pos): return False
+
+        yes_btn.draw(screen, fonts['normal'])
+        no_btn.draw(screen, fonts['normal'])
+        p.display.flip()
+        clock.tick(30)
+
+class MessageDisplay:
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        self.current_message = ""
+        self.message_color = TEXT_COLOR
+        self.message_end_time = 0
+        scale_factor = min(width, height) / 800
+        self.font = p.font.SysFont("Arial", int(28 * scale_factor), True)
+        self.priority_message = False
+
+    def show_message(self, message, color, duration=2000, priority=False):
+        print(f"[MessageDisplay] Showing message: {message}")
+        current_time = p.time.get_ticks()
+        if not self.priority_message or priority or current_time >= self.message_end_time:
+            self.current_message = message
+            self.message_color = color
+            self.message_end_time = current_time + duration
+            self.priority_message = priority
+
+    def draw(self, surface):
+        current_time = p.time.get_ticks()
+        if current_time < self.message_end_time and self.current_message:
+            scale_factor = min(self.width, self.height) / 800
+            bg_height = int(60 * scale_factor) if self.priority_message else int(50 * scale_factor)
+            bg_rect = p.Rect(0, self.height - bg_height, self.width, bg_height)
+
+            bg_surface = p.Surface((bg_rect.width, bg_rect.height), p.SRCALPHA)
+            bg_surface.fill((30, 30, 40, 200) if self.priority_message else (30, 30, 40, 180))
+            surface.blit(bg_surface, bg_rect)
+
+            border_color = ERROR_COLOR if self.priority_message else HIGHLIGHT_COLOR
+            p.draw.rect(surface, border_color, bg_rect, 2, border_radius=5)
+
+            text = self.font.render(self.current_message, True, self.message_color)
+            text_rect = text.get_rect(center=(self.width // 2, self.height - bg_height // 2))
+            surface.blit(text, text_rect)
+            return True
+        else:
+            if current_time >= self.message_end_time:
+                self.priority_message = False
+            return False
+
+# ------------------------- Main Function -------------------------
+def main():
+    global player_name, difficulty
+    global manual_paused, pause_start_time
+    global awaiting_robot_done, pending_robot_move_num
+    global lastMoveTimestamp
+
+    screen, WIDTH, HEIGHT, SQ_SIZE = init_pygame()
+    scale_factor = min(WIDTH, HEIGHT) / 800
+    fonts = init_fonts(scale_factor)
+
+    check_screen = CheckHardwareScreen(screen)
+    if not check_screen.run():
+        p.quit(); sys.exit()
+
+    # Load calibration
+    try:
+        brown_model = np.load(BROWN_MODEL_PATH)
+        lower_hsv_brown = brown_model["lower"]
+        upper_hsv_brown = brown_model["upper"]
+
+        board_calib = np.load(BOARD_CALIB_PATH, allow_pickle=True)
+        warp_matrix = board_calib["warp_matrix"]
+        square_names = board_calib["square_names"]
+    except Exception as e:
+        print(f"Failed to load calibration: {e}")
+        p.quit(); sys.exit()
+
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(main={"size": (1280, 720), "format": "RGB888"})
+    picam2.configure(config)
+    picam2.start()
+    time.sleep(2)
+
+    loadImages(SQ_SIZE)
+    message_display = MessageDisplay(WIDTH, HEIGHT)
+
+    stop_event = threading.Event()
+    camera_thread = None
+    camera_move_queue = None
+
+    # Illegal move tracking
+    illegal_move = None
+    illegal_move_time = 0
+    illegal_move_duration = 3000
+
+    while True:
+        player_name = getPlayerName(screen)
+
+        # Stop any existing camera thread
+        if camera_thread and camera_thread.is_alive():
+            stop_event.set()
+            camera_thread.join()
+            stop_event.clear()
+
+        camera_move_queue = queue.Queue(maxsize=5)
+        camera_thread = threading.Thread(
+            target=camera_move_detector,
+            args=(camera_move_queue, picam2, stop_event),
+            daemon=True
+        )
+        camera_thread.start()
+
+        check_initial_pieces(
+            screen, picam2, warp_matrix, square_names,
+            lower_hsv_brown, upper_hsv_brown,
+            fonts
+        )
+
+        difficulty = getDifficultyChoice(screen, player_name)
+
+        gs = GameState()
+        validMoves = gs.getValidMoves()
+        moveMade = False
+        animate = False
+        running = True
+        gameOver = False
+        playerOne = True  # Human plays as white (brown pieces)
+        playerTwo = False  # AI plays as black
+        AIThinking = False
+        moveFinderProcess = None
+        returnQueue = None
+        moveUndone = False
+        lastInCheck = False
+        checkmatePrinted = False
+        board_history = {}
+        halfmove_clock = 0
+        prev_move = None
+
+        # reset clocks for new game
+        manual_paused = False
+        pause_start_time = None
+        moveTimes.clear()
+        usedTime["white"] = 0
+        usedTime["black"] = 0
+        lastMoveTimestamp = time.time()
+        awaiting_robot_done = False
+        pending_robot_move_num = None
+
+        clock = p.time.Clock()
+
+        while running:
+            current_ticks = p.time.get_ticks()
+            humanTurn = (gs.whiteToMove and playerOne) or (not gs.whiteToMove and playerTwo)
+
+            # timeout detection (win on time)
+            white_rem, black_rem = compute_remaining_times(gs)
+            if white_rem <= 0 or black_rem <= 0:
+                gameOver = True
+                white_won = (black_rem <= 0)  # if black ran out, white wins
+                showEndGameMessage(screen, player_name, white_won)
+                running = False
+                break
+
+            # Clear illegal move highlight after timeout
+            if illegal_move and current_ticks - illegal_move_time > illegal_move_duration:
+                illegal_move = None
+
+            for e in p.event.get():
+                if e.type == p.QUIT or (e.type == p.KEYDOWN and e.key in (p.K_ESCAPE, p.K_q)):
+                    running = False
+                    p.quit(); sys.exit()
+
+                elif e.type == p.MOUSEBUTTONDOWN:
+                    # Timer buttons
+                    if start_btn_rect and start_btn_rect.collidepoint(e.pos):
+                        # toggle manual pause
+                        if not manual_paused:
+                            manual_paused = True
+                            pause_start_time = time.time()
+                        else:
+                            manual_paused = False
+                            if pause_start_time is not None:
+                                # exclude pause from active turn time
+                                lastMoveTimestamp += (time.time() - pause_start_time)
+                                pause_start_time = None
+                    elif reset_btn_rect and reset_btn_rect.collidepoint(e.pos):
+                        manual_paused = True
+                        pause_start_time = None
+                        moveTimes.clear()
+                        usedTime["white"] = 0
+                        usedTime["black"] = 0
+                        lastMoveTimestamp = time.time()
+                        message_display.show_message("Clocks reset", HIGHLIGHT_COLOR, 1500, False)
+
+                elif e.type == p.KEYDOWN:
+                    if e.key == p.K_z:
+                        gs.undoMove()
+                        moveMade = True
+                        animate = False
+                        gameOver = False
+                        illegal_move = None
+                        if AIThinking and moveFinderProcess is not None:
+                            moveFinderProcess.terminate()
+                            AIThinking = False
+                            moveFinderProcess = None
+                            returnQueue = None
+                        moveUndone = True
+
+                        # Update trackers after undo
+                        if prev_move:
+                            if prev_move.pieceMoved[1] != 'p' and prev_move.pieceCaptured == '--':
+                                halfmove_clock = max(halfmove_clock - 1, 0)
+
+                            board_fen = boardToFen(gs)
+                            if board_fen in board_history:
+                                board_history[board_fen] -= 1
+                                if board_history[board_fen] <= 0:
+                                    del board_history[board_fen]
+
+                        prev_move = gs.moveLog[-1] if gs.moveLog else None
+
+                    elif e.key == p.K_r:
+                        running = False
+
+            if not running: break
+
+            # Human move via camera detection
+            if not gameOver and humanTurn and not moveUndone:
+                move = get_camera_move(gs, camera_move_queue)
+                if move:
+                    start_alg = pos_to_alg(move.startRow, move.startCol)
+                    end_alg = pos_to_alg(move.endRow, move.endCol)
+
+                    message_display.show_message(f"Move detected: {start_alg.upper()} -> {end_alg.upper()}",
+                                               HIGHLIGHT_COLOR, 1500, False)
+
+                    if move in validMoves:
+                        gs.makeMove(move)
+                        moveMade = True
+                        animate = True
+                        illegal_move = None
+
+                        # 50-move rule clock
+                        if move.pieceMoved[1] == 'p' or move.pieceCaptured != '--':
+                            halfmove_clock = 0
+                        else:
+                            halfmove_clock += 1
+
+                        board_fen = boardToFen(gs)
+                        board_history[board_fen] = board_history.get(board_fen, 0) + 1
+                        prev_move = move
+
+                        message_display.show_message(f"Valid move: {start_alg.upper()} -> {end_alg.upper()}",
+                                                    SUCCESS_COLOR, 2000, False)
+                    else:
+                        illegal_move = move
+                        illegal_move_time = current_ticks
+                        message_display.show_message(f"Invalid move: {start_alg.upper()} -> {end_alg.upper()}. Try again.",
+                                                    ERROR_COLOR, 5000, True)
+                else:
+                    p.time.wait(50)
+
+            # AI move handling
+            if not gameOver and not humanTurn and not moveUndone:
+                if not AIThinking:
+                    AIThinking = True
+                    if difficulty == "hard":
+                        returnQueue = MPQueue()
+                        moveFinderProcess = Process(target=findBestMove, args=(gs, validMoves, returnQueue))
+                        moveFinderProcess.start()
+                    else:
+                        AIMove = findRandomMove(validMoves)
+                        gs.makeMove(AIMove)
+
+                        # mark robot timing to be finalized after MOVE_DONE
+                        awaiting_robot_done = True
+                        pending_robot_move_num = len(gs.moveLog)
+
+                        start = pos_to_alg(AIMove.startRow, AIMove.startCol)
+                        end = pos_to_alg(AIMove.endRow, AIMove.endCol)
+
+                        if AIMove.isCastleMove:
+                            start1, end1 = get_rook_castle_squares(AIMove)
+                            send_serial(start, end, start1, end1)
+                        elif AIMove.pieceCaptured != '--':
+                            capture_pos = pos_to_alg(AIMove.endRow, AIMove.endCol)
+                            send_serial(capture_pos, start, end)
+                        else:
+                            send_serial(start, end)
+
+                        wait_for_move_done(screen, clock, gs, validMoves)
+                        animate = False
+                        moveMade = True
+                        AIThinking = False
+
+                        # 50-move rule clock
+                        if AIMove.pieceMoved[1] == 'p' or AIMove.pieceCaptured != '--':
+                            halfmove_clock = 0
+                        else:
+                            halfmove_clock += 1
+
+                        board_fen = boardToFen(gs)
+                        board_history[board_fen] = board_history.get(board_fen, 0) + 1
+                        prev_move = AIMove
+
+                        if gs.inCheck:
+                            message_display.show_message("Check!", ERROR_COLOR, 3000, True)
+
+                if difficulty == "hard":
+                    if moveFinderProcess and not moveFinderProcess.is_alive():
+                        try:
+                            AIMove = returnQueue.get(timeout=1)
+                        except queue.Empty:
+                            AIMove = findRandomMove(validMoves)
+
+                        if AIMove is None:
+                            AIMove = findRandomMove(validMoves)
+
+                        gs.makeMove(AIMove)
+
+                        # mark robot timing to be finalized after MOVE_DONE
+                        awaiting_robot_done = True
+                        pending_robot_move_num = len(gs.moveLog)
+
+                        start = pos_to_alg(AIMove.startRow, AIMove.startCol)
+                        end = pos_to_alg(AIMove.endRow, AIMove.endCol)
+
+                        if AIMove.isCastleMove:
+                            start1, end1 = get_rook_castle_squares(AIMove)
+                            send_serial(start, end, start1, end1)
+                        elif AIMove.pieceCaptured != '--':
+                            capture_pos = pos_to_alg(AIMove.endRow, AIMove.endCol)
+                            send_serial(capture_pos, start, end)
+                        else:
+                            send_serial(start, end)
+
+                        wait_for_move_done(screen, clock, gs, validMoves)
+                        animate = False
+                        moveMade = True
+                        AIThinking = False
+
+                        if AIMove.pieceMoved[1] == 'p' or AIMove.pieceCaptured != '--':
+                            halfmove_clock = 0
+                        else:
+                            halfmove_clock += 1
+
+                        board_fen = boardToFen(gs)
+                        board_history[board_fen] = board_history.get(board_fen, 0) + 1
+                        prev_move = AIMove
+
+                        moveFinderProcess = None
+                        returnQueue = None
+
+                        if gs.inCheck:
+                            message_display.show_message("Check!", ERROR_COLOR, 3000, True)
+
+            # Check notification
+            if gs.inCheck and not lastInCheck:
+                lastInCheck = True
+                if humanTurn:
+                    message_display.show_message("Check!", ERROR_COLOR, 3000, True)
+            elif not gs.inCheck:
+                lastInCheck = False
+
+            if moveUndone:
+                moveUndone = False
+
+            if moveMade and not moveUndone:
+                validMoves = gs.getValidMoves()
+                moveMade = False
+                animate = False
+
+            # Draw game board and panel
+            drawGameState(screen, gs, validMoves, illegal_move)
+
+            # Overlay messages
+            message_display.draw(screen)
+
+            # End-of-game checks besides timeouts
+            if gs.checkmate:
+                gameOver = True
+                white_won = not gs.whiteToMove
+                if not checkmatePrinted:
+                    checkmatePrinted = True
+                    showEndGameMessage(screen, player_name, white_won)
+                    running = False
+
+            elif gs.stalemate:
+                gameOver = True
+                message_display.show_message("Draw: Stalemate", WARNING_COLOR, 5000, True)
+                p.display.flip()
+                start_time = p.time.get_ticks()
+                while p.time.get_ticks() - start_time < 5000:
+                    for event in p.event.get():
+                        if event.type == p.QUIT or (event.type == p.KEYDOWN and event.key in (p.K_ESCAPE, p.K_q)):
+                            p.quit(); sys.exit()
+                        if event.type == p.KEYDOWN or event.type == p.MOUSEBUTTONDOWN:
+                            break
+                    else:
+                        continue
+                    break
+                running = False
+
+            elif isInsufficientMaterial(gs.board):
+                gameOver = True
+                message_display.show_message("Draw: Insufficient Material", WARNING_COLOR, 5000, True)
+                p.display.flip()
+                start_time = p.time.get_ticks()
+                while p.time.get_ticks() - start_time < 5000:
+                    for event in p.event.get():
+                        if event.type == p.QUIT or (event.type == p.KEYDOWN and event.key in (p.K_ESCAPE, p.K_q)):
+                            p.quit(); sys.exit()
+                        if event.type == p.KEYDOWN or event.type == p.MOUSEBUTTONDOWN:
+                            break
+                    else:
+                        continue
+                    break
+                running = False
+
+            elif halfmove_clock >= 100:  # 50-move rule
+                gameOver = True
+                message_display.show_message("Draw: 50-Move Rule", WARNING_COLOR, 5000, True)
+                p.display.flip()
+                start_time = p.time.get_ticks()
+                while p.time.get_ticks() - start_time < 5000:
+                    for event in p.event.get():
+                        if event.type == p.QUIT or (event.type == p.KEYDOWN and event.key in (p.K_ESCAPE, p.K_q)):
+                            p.quit(); sys.exit()
+                        if event.type == p.KEYDOWN or event.type == p.MOUSEBUTTONDOWN:
+                            break
+                    else:
+                        continue
+                    break
+                running = False
+
+            clock.tick(MAX_FPS)
+            p.display.flip()
+
+        # Replay prompt
+        again = play_again_prompt(screen)
+        if not again:
+            print("Thanks for playing!")
+            break
+
+    # Clean up camera thread before exit
+    if camera_thread and camera_thread.is_alive():
+        stop_event.set()
+        camera_thread.join()
+
+    p.quit()
+    sys.exit()
+
+if __name__ == "__main__":
+    main()
