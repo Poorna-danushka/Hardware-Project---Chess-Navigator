@@ -11,21 +11,21 @@ It detects moves in real time using a Raspberry Pi camera, processes them with O
 
 ## 📂 Project Structure
 
-ChessNavigator/
-    docs/                # Documentation, reports, diagrams, presentations
-        images/          # Screenshots and demo pictures
-    hardware/            # PCB design files, schematics, calibration data
-    microcontroller/     # Arduino code for servo & robotic arm control
-        servo_control.ino
-    vision/              # Python OpenCV chess detection system
-        chess_tracker.py
-        calibration.py
-    ui/                  # Pygame UI code for chess interface
-        chess_main.py
-    engine/              # Chess engine + smart move finder
-        smartMoveFinder.py
-        chessengine.py
-    tests/               # Testing scripts for system components
+- ChessNavigator/
+  -   docs/                # Documentation, reports, diagrams, presentations
+    -  images/          # Screenshots and demo pictures
+    - hardware/            # PCB design files, schematics, calibration data
+   -  microcontroller/     # Arduino code for servo & robotic arm control
+       -  servo_control.ino
+    - vision/              # Python OpenCV chess detection system
+      -   chess_tracker.py
+       -  calibration.py
+  -   ui/                  # Pygame UI code for chess interface
+    -  chess_main.py
+    - engine/              # Chess engine + smart move finder
+      -   smartMoveFinder.py
+        - chessengine.py
+    - tests/               # Testing scripts for system components
 
 
 ## ⚙️ Tech Stack
@@ -37,8 +37,8 @@ ChessNavigator/
 
 👥 Team
 
-**Poorna Danushka** (234095F)
-**Lisitha** (234115U)
-**Chathuni** (234098R)
-**Chamalka** (234079K)
-**Pavidu** (234127H)
+- **Poorna Danushka** (234095F)
+- **Lisitha** (234115U)
+- **Chathuni** (234098R)
+- **Chamalka** (234079K)
+- **Pavidu** (234127H)
